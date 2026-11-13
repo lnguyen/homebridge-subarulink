@@ -49,33 +49,29 @@ jobs:
             echo "should_publish=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Install pnpm
-        if: steps.check.outputs.should_publish == 'true'
-        uses: pnpm/action-setup@v6
-
       - name: Setup Node.js
         if: steps.check.outputs.should_publish == 'true'
         uses: actions/setup-node@v7
         with:
           node-version-file: 'package.json'
           registry-url: 'https://registry.npmjs.org'
-          cache: pnpm
+          cache: npm
 
       - name: Install dependencies
         if: steps.check.outputs.should_publish == 'true'
-        run: pnpm install --frozen-lockfile
+        run: npm ci
 
       - name: Build TypeScript
         if: steps.check.outputs.should_publish == 'true'
-        run: pnpm run build
+        run: npm run build
 
       - name: Bootstrap Python >=3.14 & subarulink
         if: steps.check.outputs.should_publish == 'true'
-        run: pnpm run bootstrap
+        run: npm run bootstrap
 
       - name: Run smoke & integration test suite
         if: steps.check.outputs.should_publish == 'true'
-        run: pnpm test
+        run: npm test
 
       - name: Verify built package contents
         if: steps.check.outputs.should_publish == 'true'
@@ -86,7 +82,7 @@ jobs:
             if (!fs.existsSync("dist/index.js") || !fs.existsSync("dist/index.d.ts")) {
               throw new Error("Missing compiled dist/index.js or dist/index.d.ts");
             }
-            const packInfo = JSON.parse(execSync("pnpm pack --dry-run --json", { encoding: "utf8" }));
+            const packInfo = JSON.parse(execSync("npm pack --dry-run --json --ignore-scripts", { encoding: "utf8" }));
             const packEntry = Array.isArray(packInfo) ? packInfo[0] : packInfo;
             const files = new Set(packEntry.files.map((f) => f.path));
             for (const req of ["dist/index.js", "python/subaru_bridge.py", "scripts/bootstrap-python.mjs", "config.schema.json"]) {

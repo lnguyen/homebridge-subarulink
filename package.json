@@ -10,7 +10,6 @@
   "license": "Apache-2.0",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
-  "packageManager": "pnpm@12.16.1",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/misraaks/homebridge-subarulink.git"
@@ -35,8 +34,8 @@
   },
   "scripts": {
     "clean": "node -e \"fs.rmSync('./dist', { recursive: true, force: true })\"",
-    "build": "pnpm run clean && tsc",
-    "prepublishOnly": "pnpm run build",
+    "build": "npm run clean && tsc",
+    "prepack": "npm run build",
     "bootstrap": "node scripts/bootstrap-python.mjs --runtime-dir ./.runtime",
     "watch": "tsc --watch",
     "auth": "node scripts/interactive-auth.mjs",

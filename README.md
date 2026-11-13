@@ -86,13 +86,14 @@ If you already use `subarulink` (for example via CLI or Home Assistant) and have
 
 ## Development
 
-Requires **Node.js** (`22.x`, `24.x`, or `26.x`) and **pnpm**:
+Requires **Node.js** (`22.x`, `24.x`, or `26.x`) and npm:
 
 ```bash
-pnpm install
-pnpm run build
-pnpm run bootstrap   # provisions ./.runtime for local testing
-pnpm test            # runs JSON-RPC, crash-recovery, and Homebridge v2 test suite
+npm install
+npm run build
+npm run bootstrap   # provisions ./.runtime for local testing
+npm test            # runs JSON-RPC, crash-recovery, and Homebridge v2 test suite
+npm pack            # builds dist/ automatically (prepack), then writes homebridge-subarulink-<version>.tgz
 ```
 
 ---

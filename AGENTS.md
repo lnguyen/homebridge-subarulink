@@ -13,8 +13,8 @@
 1. **Never push directly to `main`.** `main` is protected by a GitHub Ruleset requiring pull requests, passing Node 22/24/26 CI checks, linear history, and clean CodeQL results.
 2. **Branch naming:** Create short-lived branches off `main` (`fix/<topic>`, `feat/<topic>`, `chore/<topic>`, or `docs/<topic>`).
 3. **Local verification before pushing:**
-   - Run `pnpm run build` to compile TypeScript cleanly into `dist/`.
-   - Run `pnpm test` to execute the smoke and integration suite (run `pnpm run bootstrap` first if `.runtime/` is not yet initialized).
+   - Run `npm run build` to compile TypeScript cleanly into `dist/`.
+   - Run `npm test` to execute the smoke and integration suite (run `npm run bootstrap` first if `.runtime/` is not yet initialized).
    - Verify `package.json` and `config.schema.json` remain valid JSON and that `"files"` in `package.json` only ships runtime artifacts.
 4. **Pull requests & merging:**
    - Open pull requests against `main` using `gh pr create -R misraaks/homebridge-subarulink`.

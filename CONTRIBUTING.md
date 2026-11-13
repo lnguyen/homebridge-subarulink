@@ -15,13 +15,13 @@ Thanks for your interest in improving `homebridge-subarulink`! To keep maintenan
 
 ## Local Setup & Testing
 
-Prerequisites: **Node.js 22+** and **pnpm**.
+Prerequisites: **Node.js 22+** (npm is included).
 
 ```bash
-pnpm install
-pnpm run build
-pnpm run bootstrap   # Downloads an isolated Python >=3.14 venv into ./.runtime (first run only)
-pnpm test            # Runs the mocked end-to-end verification suite (no Subaru account needed)
+npm install
+npm run build
+npm run bootstrap   # Downloads an isolated Python >=3.14 venv into ./.runtime (first run only)
+npm test            # Runs the mocked end-to-end verification suite (no Subaru account needed)
 ```
 
 ## Submitting a Pull Request
@@ -29,6 +29,6 @@ pnpm test            # Runs the mocked end-to-end verification suite (no Subaru 
 1. Fork the repository and create a branch from `main` (e.g., `fix/short-description`).
 2. Keep changes focused—one fix or topic per PR.
 3. Add or update coverage in `scripts/smoke-test.mjs` when changing runtime behavior.
-4. Make sure `pnpm run build` and `pnpm test` pass locally.
+4. Make sure `npm run build` and `npm test` pass locally.
 5. **Do not bump `"version"` in `package.json`**—releases are cut separately by the maintainer.
 6. Open a PR against `main`. All PRs are squash-merged once CI (Node 22/24/26) and CodeQL checks pass.

@@ -4,7 +4,7 @@
 
 ## Verification Checklist
 
-- [ ] `pnpm run build` compiles cleanly and `dist/` is up to date
-- [ ] `pnpm test` passes all smoke and integration tests
+- [ ] `npm run build` compiles cleanly and `dist/` is up to date
+- [ ] `npm test` passes all smoke and integration tests
 - [ ] No real MySubaru credentials, PINs, `deviceId`s, or VINs are included in code, tests, or logs
 

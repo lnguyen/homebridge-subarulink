@@ -28,20 +28,17 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v7
 
-      - name: Install pnpm
-        uses: pnpm/action-setup@v6
-
       - name: Setup Node.js ${{ matrix.node-version }}
         uses: actions/setup-node@v7
         with:
           node-version: ${{ matrix.node-version }}
-          cache: pnpm
+          cache: npm
 
       - name: Install dependencies
-        run: pnpm install --frozen-lockfile
+        run: npm ci
 
       - name: Build TypeScript
-        run: pnpm run build
+        run: npm run build
 
       - name: Verify built package & JSON manifests
         run: |
@@ -53,7 +50,7 @@ jobs:
             if (!fs.existsSync("dist/index.js") || !fs.existsSync("dist/index.d.ts")) {
               throw new Error("Missing compiled dist/index.js or dist/index.d.ts");
             }
-            const packInfo = JSON.parse(execSync("pnpm pack --dry-run --json", { encoding: "utf8" }));
+            const packInfo = JSON.parse(execSync("npm pack --dry-run --json --ignore-scripts", { encoding: "utf8" }));
             const packEntry = Array.isArray(packInfo) ? packInfo[0] : packInfo;
             const files = new Set(packEntry.files.map((f) => f.path));
             for (const req of ["dist/index.js", "python/subaru_bridge.py", "scripts/bootstrap-python.mjs", "config.schema.json"]) {
@@ -67,7 +64,7 @@ jobs:
           '
 
       - name: Bootstrap Python >=3.14 & subarulink
-        run: pnpm run bootstrap
+        run: npm run bootstrap
 
       - name: Run smoke & integration test suite
-        run: pnpm test
+        run: npm test
