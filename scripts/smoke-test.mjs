@@ -14,13 +14,13 @@
  *    - Automatic daemon SIGKILL crash recovery (respawn + automatic re-`init` before next command)
  * 4. Homebridge v2.4.0 API registration & cached `PlatformAccessory` restart resilience
  *    (verifies zero duplicate UUID/subtype errors and stale service pruning).
- * 5. Fire-and-forget remote commands: HomeKit writes return immediately, repeated writes while a
- *    command is in flight send nothing extra, queued opposite requests run in order, and lock /
- *    remote-start state follows MySubaru confirmations (rolled back on failure).
+ * 5. Stateless lock / unlock / start / stop buttons: presses return immediately, repeated presses
+ *    while a command is in flight send nothing extra, queued opposite requests run in order,
+ *    buttons never report a state and flip back to Off on their own.
  * 6. Account-wide command queue: simultaneous commands (e.g. start + unlock from one automation)
  *    reach MySubaru one at a time with `commandGapSeconds` between them; failures do not block.
  * 7. Remote start priority: fired together with an unlock (in either order), remote start is sent
- *    first because it locks the car; a confirmed remote start on its own marks the doors Locked.
+ *    first because it locks the car.
  */
 
 import assert from 'node:assert/strict';
@@ -708,11 +708,13 @@ async function testHomebridgeV2CachedAccessoryRestart() {
       Characteristic.ContactSensorState.CONTACT_NOT_DETECTED,
     );
     assert.equal(
-      accessory
-        .getServiceById(Service.LockMechanism, 'lock-doors')
-        .getCharacteristic(Characteristic.LockCurrentState).value,
-      Characteristic.LockCurrentState.UNSECURED,
+      accessory.getService(Service.LockMechanism),
+      undefined,
+      'No stateful lock service: lock/unlock are momentary buttons',
     );
+    for (const sub of ['button-lock', 'button-unlock', 'button-remote-stop', 'remote-start-primary']) {
+      assert.ok(accessory.getServiceById(Service.Switch, sub), `Missing ${sub} button`);
+    }
     assert.equal(
       accessory
         .getServiceById(Service.TemperatureSensor, 'ext-temp')
@@ -727,7 +729,9 @@ async function testHomebridgeV2CachedAccessoryRestart() {
     );
     handler1.dispose();
 
-    // Boot #2: Simulated Homebridge restart with cached accessory AND modified config
+    // Boot #2: Simulated Homebridge restart with cached accessory AND modified config.
+    // The cache also carries a LockMechanism from an older plugin version, which must be removed.
+    accessory.addService(Service.LockMechanism, 'Crosstrek PHEV Doors', 'lock-doors');
     platform.config.defaultPreset = 'Winter Defrost';
     platform.config.additionalPresets = ['Full Cool']; // 'Auto' and 'Morning (Warm)!' removed!
     platform.config.exposeHornSwitch = false; // Horn disabled!
@@ -749,6 +753,11 @@ async function testHomebridgeV2CachedAccessoryRestart() {
       accessory.getServiceById(Service.Switch, 'panic-horn'),
       undefined,
       'Disabled horn switch should be pruned from cached accessory',
+    );
+    assert.equal(
+      accessory.getService(Service.LockMechanism),
+      undefined,
+      'Legacy cached LockMechanism should be removed',
     );
     assert.equal(
       accessory
@@ -813,12 +822,13 @@ async function testHomebridgeV2CachedAccessoryRestart() {
 }
 
 /**
- * Regression test for duplicate remote commands: HomeKit writes must return
- * immediately, repeated writes while a command is in flight must not send it
- * again, and state must update only when MySubaru confirms.
+ * Regression test for duplicate remote commands with stateless buttons: presses
+ * must return immediately, repeated presses while a command is in flight must
+ * not send it again, buttons never report a lock/engine state, and they flip
+ * back to Off on their own.
  */
 async function testFireAndForgetCommands() {
-  console.log('5. Testing fire-and-forget lock / remote start (no duplicate commands)...');
+  console.log('5. Testing stateless lock / unlock / start / stop buttons (fire-and-forget, no duplicates)...');
   const api = new HomebridgeAPI();
   const logger = createSilentLogger();
   const platform = new SubaruLinkPlatform(
@@ -835,49 +845,43 @@ async function testFireAndForgetCommands() {
   );
   const { calls } = installControllableBridge(platform);
   const { handler, accessory } = createTestVehicleAccessory(api, platform);
-  const { Service, Characteristic } = api.hap;
-  const lock = accessory.getServiceById(Service.LockMechanism, 'lock-doors');
-  const target = lock.getCharacteristic(Characteristic.LockTargetState);
-  const current = lock.getCharacteristic(Characteristic.LockCurrentState);
+  const unlockBtn = buttonOn(api, accessory, 'button-unlock');
+  const lockBtn = buttonOn(api, accessory, 'button-lock');
+  const startBtn = buttonOn(api, accessory, 'remote-start-primary');
+  const stopBtn = buttonOn(api, accessory, 'button-remote-stop');
 
-  // 1. Three back-to-back unlock writes (the reported bug) -> exactly one command.
+  // 1. Three back-to-back Unlock presses (the reported bug) -> exactly one command.
   const writeStart = Date.now();
   for (let i = 0; i < 3; i++) {
-    await target.handleSetRequest(Characteristic.LockTargetState.UNSECURED);
+    await unlockBtn.handleSetRequest(true);
   }
-  assert.ok(Date.now() - writeStart < 500, 'HomeKit writes must return without waiting for MySubaru');
+  assert.ok(Date.now() - writeStart < 500, 'Button presses must return without waiting for MySubaru');
   await settleTick();
-  assert.equal(calls.length, 1, 'Repeated unlock writes while in flight must send only one command');
+  assert.equal(calls.length, 1, 'Repeated presses while in flight must send only one command');
   assert.equal(calls[0].command, 'unlock');
   assert.deepEqual(calls[0].args, { door: 'ALL_DOORS' });
-  assert.equal(
-    await current.handleGetRequest(),
-    Characteristic.LockCurrentState.SECURED,
-    'Current state changes only on confirmation',
-  );
-  assert.equal(await target.handleGetRequest(), Characteristic.LockTargetState.UNSECURED);
-
+  assert.equal(await unlockBtn.handleGetRequest(), false, 'Buttons never report a state');
   calls[0].resolve(true);
   await handler.lockRunner.whenIdle();
-  assert.equal(current.value, Characteristic.LockCurrentState.UNSECURED, 'Confirmed unlock updates current state');
+  assert.ok(logger.logs.some((l) => l.msg.includes('Vehicle unlocked (ALL_DOORS).')));
+  await sleepMs(1100);
+  assert.equal(unlockBtn.value, false, 'Button flips back to Off on its own');
 
-  // 2. Failed lock -> state rolls back to the last confirmed state, error logged.
-  await target.handleSetRequest(Characteristic.LockTargetState.SECURED);
+  // 2. Failed lock -> error logged.
+  await lockBtn.handleSetRequest(true);
   await settleTick();
   assert.equal(calls.length, 2);
+  assert.equal(calls[1].command, 'lock');
   calls[1].resolve(false);
   await handler.lockRunner.whenIdle();
-  await settleTick();
-  assert.equal(current.value, Characteristic.LockCurrentState.UNSECURED, 'Failed lock must not report locked');
-  assert.equal(target.value, Characteristic.LockTargetState.UNSECURED, 'Failed lock rolls target back');
   assert.ok(
     logger.logs.some((l) => l.level === 'error' && l.msg.includes('Lock command failed')),
     'Failed lock must be logged as an error',
   );
 
-  // 3. Lock tapped, then unlock tapped while the lock is in flight -> unlock queued, runs after.
-  await target.handleSetRequest(Characteristic.LockTargetState.SECURED);
-  await target.handleSetRequest(Characteristic.LockTargetState.UNSECURED);
+  // 3. Lock pressed, then Unlock pressed while the lock is in flight -> unlock queued, runs after.
+  await lockBtn.handleSetRequest(true);
+  await unlockBtn.handleSetRequest(true);
   await settleTick();
   assert.equal(calls.length, 3, 'Opposite request is queued, not sent concurrently');
   calls[2].resolve(true);
@@ -886,37 +890,48 @@ async function testFireAndForgetCommands() {
   assert.equal(calls[3].command, 'unlock');
   calls[3].resolve(true);
   await handler.lockRunner.whenIdle();
-  assert.equal(current.value, Characteristic.LockCurrentState.UNSECURED);
 
-  // 4. Remote start: repeated On writes -> one command; switch shows On while pending,
-  //    reverts to Off on failure.
-  const primary = accessory
-    .getServiceById(Service.Switch, 'remote-start-primary')
-    .getCharacteristic(Characteristic.On);
-  await primary.handleSetRequest(true);
-  await primary.handleSetRequest(true);
+  // 4. Remote Start pressed twice -> one command; failure logged.
+  await startBtn.handleSetRequest(true);
+  await startBtn.handleSetRequest(true);
   await settleTick();
-  assert.equal(calls.length, 5, 'Repeated remote start writes must send only one command');
+  assert.equal(calls.length, 5, 'Repeated start presses must send only one command');
   assert.equal(calls[4].command, 'remote_start');
   assert.deepEqual(calls[4].args, { preset: 'Full Heat' });
-  assert.equal(await primary.handleGetRequest(), true, 'Switch reads On while start is pending');
   calls[4].reject(new Error('RemoteServiceFailure: low fuel'));
   await handler.engineRunner.whenIdle();
-  assert.equal(primary.value, false, 'Failed remote start reverts the switch to Off');
-  assert.equal(await primary.handleGetRequest(), false);
+  assert.ok(logger.logs.some((l) => l.level === 'error' && l.msg.includes('Remote start (Full Heat) failed')));
 
-  // 5. Successful start, then a repeat On write while running is not re-sent.
-  await primary.handleSetRequest(true);
+  // 5. Turning a button Off sends nothing.
+  await startBtn.handleSetRequest(false);
+  await stopBtn.handleSetRequest(false);
   await settleTick();
+  assert.equal(calls.length, 5, 'Turning a button Off must not send a command');
+
+  // 6. Stop Engine button sends remote_stop.
+  await stopBtn.handleSetRequest(true);
+  await settleTick();
+  assert.equal(calls[5].command, 'remote_stop');
   calls[5].resolve(true);
   await handler.engineRunner.whenIdle();
-  assert.equal(primary.value, true);
-  await primary.handleSetRequest(true);
+
+  // 7. Stateless: pressing Start again after a confirmed start sends it again.
+  await startBtn.handleSetRequest(true);
   await settleTick();
-  assert.equal(calls.length, 6, 'Start is not re-sent while the engine is confirmed running');
+  assert.equal(calls.length, 7);
+  assert.equal(calls[6].command, 'remote_start');
+  calls[6].resolve(true);
+  await handler.engineRunner.whenIdle();
 
   handler.dispose();
-  console.log('   ✓ Writes return immediately, duplicates dropped, state follows MySubaru confirmations');
+  console.log('   ✓ Presses return immediately, duplicates dropped, buttons stateless and self-resetting');
+}
+
+/** The On characteristic of a button (Switch service) by subtype. */
+function buttonOn(api, accessory, subtype) {
+  const svc = accessory.getServiceById(api.hap.Service.Switch, subtype);
+  assert.ok(svc, `Missing ${subtype} button`);
+  return svc.getCharacteristic(api.hap.Characteristic.On);
 }
 
 const settleTick = () => new Promise((r) => setImmediate(r));
@@ -987,23 +1002,14 @@ async function testCommandQueueSpacing() {
   );
   const { calls } = installControllableBridge(platform);
   const { handler, accessory } = createTestVehicleAccessory(api, platform);
-  const { Service, Characteristic } = api.hap;
-  const lockTarget = accessory
-    .getServiceById(Service.LockMechanism, 'lock-doors')
-    .getCharacteristic(Characteristic.LockTargetState);
-  const lockCurrent = accessory
-    .getServiceById(Service.LockMechanism, 'lock-doors')
-    .getCharacteristic(Characteristic.LockCurrentState);
-  const primary = accessory
-    .getServiceById(Service.Switch, 'remote-start-primary')
-    .getCharacteristic(Characteristic.On);
+  const startBtn = buttonOn(api, accessory, 'remote-start-primary');
+  const unlockBtn = buttonOn(api, accessory, 'button-unlock');
+  const lockBtn = buttonOn(api, accessory, 'button-lock');
+  const stopBtn = buttonOn(api, accessory, 'button-remote-stop');
 
-  // Automation fires both at once.
+  // Automation presses both at once.
   const writeStart = Date.now();
-  await Promise.all([
-    primary.handleSetRequest(true),
-    lockTarget.handleSetRequest(Characteristic.LockTargetState.UNSECURED),
-  ]);
+  await Promise.all([startBtn.handleSetRequest(true), unlockBtn.handleSetRequest(true)]);
   assert.ok(Date.now() - writeStart < 500, 'Both HomeKit writes return immediately');
   await settleTick();
   assert.equal(calls.length, 1, 'Only one command is sent to MySubaru at a time');
@@ -1013,8 +1019,6 @@ async function testCommandQueueSpacing() {
     logger.logs.some((l) => l.msg.includes('unlock queued behind 1 other command')),
     'Queued command is logged',
   );
-  assert.equal(await primary.handleGetRequest(), true, 'Start switch shows On while pending');
-  assert.equal(await lockTarget.handleGetRequest(), Characteristic.LockTargetState.UNSECURED);
 
   // Start finishes; unlock must wait for the gap before being sent.
   calls[0].resolve(true);
@@ -1031,17 +1035,13 @@ async function testCommandQueueSpacing() {
   calls[1].resolve(true);
   await platform.commandQueue.whenIdle();
   await handler.lockRunner.whenIdle();
-  assert.equal(primary.value, true, 'Engine confirmed running');
-  assert.equal(lockCurrent.value, Characteristic.LockCurrentState.UNSECURED, 'Doors confirmed unlocked');
   assert.equal(platform.commandQueue.busy, false);
 
   // A failed command does not block the ones behind it.
-  await Promise.all([
-    lockTarget.handleSetRequest(Characteristic.LockTargetState.SECURED),
-    primary.handleSetRequest(false),
-  ]);
+  await Promise.all([lockBtn.handleSetRequest(true), stopBtn.handleSetRequest(true)]);
   await sleepMs(GAP_MS + 100); // the previous unlock just finished, so the gap applies first
   assert.equal(calls.length, 3);
+  assert.equal(calls[2].command, 'lock');
   calls[2].reject(new Error('HTTP 500'));
   await sleepMs(GAP_MS + 100);
   assert.equal(calls.length, 4, 'Command behind a failure still runs');
@@ -1049,8 +1049,7 @@ async function testCommandQueueSpacing() {
   calls[3].resolve(true);
   await platform.commandQueue.whenIdle();
   await handler.engineRunner.whenIdle();
-  assert.equal(primary.value, false, 'Engine confirmed stopped');
-  assert.equal(lockCurrent.value, Characteristic.LockCurrentState.UNSECURED, 'Failed lock left doors unlocked');
+  assert.ok(logger.logs.some((l) => l.msg.includes('Engine stopped.')));
 
   handler.dispose();
   console.log(`   ✓ Simultaneous start + unlock sent one at a time with a ${GAP_MS}ms gap; failures do not block`);
@@ -1059,7 +1058,7 @@ async function testCommandQueueSpacing() {
 /**
  * Remote start locks the car, so when an automation fires unlock and remote
  * start together, remote start must reach MySubaru first even if HomeKit
- * delivers the unlock first. A start on its own marks the doors Locked.
+ * delivers the unlock first.
  */
 async function testRemoteStartPriority() {
   console.log('7. Testing remote start goes before a simultaneous unlock (start locks the car)...');
@@ -1081,18 +1080,13 @@ async function testRemoteStartPriority() {
   );
   const { calls } = installControllableBridge(platform);
   const { handler, accessory } = createTestVehicleAccessory(api, platform);
-  const { Service, Characteristic } = api.hap;
-  const lockSvc = accessory.getServiceById(Service.LockMechanism, 'lock-doors');
-  const lockTarget = lockSvc.getCharacteristic(Characteristic.LockTargetState);
-  const lockCurrent = lockSvc.getCharacteristic(Characteristic.LockCurrentState);
-  const primary = accessory
-    .getServiceById(Service.Switch, 'remote-start-primary')
-    .getCharacteristic(Characteristic.On);
+  const unlockBtn = buttonOn(api, accessory, 'button-unlock');
+  const startBtn = buttonOn(api, accessory, 'remote-start-primary');
 
   // HomeKit delivers the unlock first, the start a few ms later (same automation).
-  await lockTarget.handleSetRequest(Characteristic.LockTargetState.UNSECURED);
+  await unlockBtn.handleSetRequest(true);
   await sleepMs(5);
-  await primary.handleSetRequest(true);
+  await startBtn.handleSetRequest(true);
   await settleTick();
   assert.equal(calls.length, 0, 'Idle queue waits the batch window before sending');
 
@@ -1106,36 +1100,16 @@ async function testRemoteStartPriority() {
 
   calls[0].resolve(true);
   await handler.engineRunner.whenIdle();
-  assert.equal(
-    await lockTarget.handleGetRequest(),
-    Characteristic.LockTargetState.UNSECURED,
-    'Pending unlock is not overwritten by the start locking the car',
-  );
-
   await sleepMs(GAP_MS + 50);
   assert.equal(calls.length, 2);
-  assert.equal(calls[1].command, 'unlock', 'Unlock runs after remote start');
+  assert.equal(calls[1].command, 'unlock', 'Unlock runs after remote start, so the car ends up unlocked');
   calls[1].resolve(true);
   await handler.lockRunner.whenIdle();
-  assert.equal(lockCurrent.value, Characteristic.LockCurrentState.UNSECURED, 'Car ends up running and unlocked');
-  assert.equal(primary.value, true);
-
-  // Stop, then a remote start on its own: HomeKit shows the doors Locked afterwards.
-  await primary.handleSetRequest(false);
-  await sleepMs(BATCH_MS + 50);
-  assert.equal(calls[2].command, 'remote_stop');
-  calls[2].resolve(true);
-  await handler.engineRunner.whenIdle();
-  await primary.handleSetRequest(true);
-  await sleepMs(BATCH_MS + GAP_MS + 50);
-  assert.equal(calls[3].command, 'remote_start');
-  calls[3].resolve(true);
-  await handler.engineRunner.whenIdle();
-  assert.equal(lockCurrent.value, Characteristic.LockCurrentState.SECURED, 'Remote start marks the doors Locked');
-  assert.equal(lockTarget.value, Characteristic.LockTargetState.SECURED);
+  await platform.commandQueue.whenIdle();
+  assert.equal(platform.commandQueue.busy, false);
 
   handler.dispose();
-  console.log('   ✓ Remote start overtakes a simultaneous unlock; start alone marks the doors Locked');
+  console.log('   ✓ Remote start overtakes a simultaneous unlock');
 }
 
 async function main() {

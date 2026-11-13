@@ -77,14 +77,6 @@
         "default": ["Full Cool", "Auto"],
         "description": "Optional additional climate preset names to expose as separate switches in HomeKit."
       },
-      "engineRunDurationMinutes": {
-        "title": "Remote Start Auto-Off Timer (Minutes)",
-        "type": "integer",
-        "default": 10,
-        "minimum": 1,
-        "maximum": 20,
-        "description": "Starlink remote start runs the engine for 10 minutes by default. The HomeKit switch will automatically revert to 'Off' after this timer expires unless turned off manually earlier (which sends remote_stop)."
-      },
       "commandGapSeconds": {
         "title": "Pause Between Queued Remote Commands (Seconds)",
         "type": "number",
@@ -177,8 +169,7 @@
       "title": "Remote Start & Climate Presets",
       "items": [
         "defaultPreset",
-        "additionalPresets",
-        "engineRunDurationMinutes"
+        "additionalPresets"
       ]
     },
     {

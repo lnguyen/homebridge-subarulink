@@ -23,8 +23,8 @@ Available HomeKit services depend on your vehicle's hardware/generation (`g1`–
 
 | HomeKit Service | Action / Telemetry | Required MySubaru Plan |
 | :--- | :--- | :--- |
-| **Door Lock (`LockMechanism`)** | Lock doors, unlock (`ALL_DOORS`, `DRIVERS_DOOR`, or `TAILGATE_DOOR`), plus lock-state sync when reported by vehicle | **Security / Security Plus / Companion+** |
-| **Remote Start (`Switch`)** | Primary switch for default climate preset (e.g., `Full Heat`) + optional switches for extra presets (`Full Cool`, `Auto`, or custom app presets). Turning **Off** early sends `remote_stop` | **Security / Security Plus / Companion+** *(push-button start / RES or PHEV)* |
+| **Lock Doors / Unlock Doors (`Switch`)** | Momentary buttons: press to send `lock` or `unlock` (`ALL_DOORS`, `DRIVERS_DOOR`, or `TAILGATE_DOOR`); the button flips back off. No lock state is shown, because MySubaru's cached lock status lags reality | **Security / Security Plus / Companion+** |
+| **Remote Start / Stop Engine (`Switch`)** | Momentary buttons: one Remote Start button for the default climate preset (e.g., `Full Heat`) plus optional buttons for extra presets (`Full Cool`, `Auto`, or custom app presets), and a **Stop Engine** button (`remote_stop`). Remote start is always sent before a simultaneous unlock, since it locks the car | **Security / Security Plus / Companion+** *(push-button start / RES or PHEV)* |
 | **Flash Lights & Horn (`Switch`)** | Trigger or stop hazard lights (`lights` / `lights_stop`) and horn (`horn` / `horn_stop`) | **Security / Security Plus / Companion+** |
 | **Unlock Tailgate (`Switch`)** | Optional momentary switch to unlock only the rear gate (`TAILGATE_DOOR`) | **Security / Security Plus / Companion+** *(supported models)* |
 | **Refresh Vehicle Status (`Switch`)** | Momentary switch calling `Controller.update` + `fetch` to wake the car's DCM on demand | **Security / Security Plus / Companion+** |

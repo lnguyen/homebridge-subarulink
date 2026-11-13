@@ -118,7 +118,6 @@ export interface SubaruLinkConfig extends PlatformConfig {
   vin?: string;
   defaultPreset?: string;
   additionalPresets?: string[];
-  engineRunDurationMinutes?: number;
   /** Seconds to wait after one remote command finishes before sending the next (default 2). */
   commandGapSeconds?: number;
   /**

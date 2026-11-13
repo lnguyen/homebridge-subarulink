@@ -3,9 +3,10 @@ import { IntentOutcome, IntentRunner } from './intentRunner';
 import { SubaruLinkPlatform } from './platform';
 import { DiscoveredVehicle, formatLogError, sanitizeHapName } from './settings';
 
+type LockIntent = 'lock' | 'unlock';
 type EngineIntent = { kind: 'start'; preset: string } | { kind: 'stop' };
 
-/** Momentary switches (tailgate, EV charge, wake) flip back to Off after this delay. */
+/** Momentary buttons flip back to Off after this delay. */
 const MOMENTARY_RESET_MS = 1000;
 
 /**
@@ -36,28 +37,34 @@ const WINDOW_SENSOR_LABELS: Record<string, string> = {
 
 /**
  * Represents a single Subaru vehicle in HomeKit with support for:
- * - Door Lock Mechanism (`lock` / `unlock` with configurable door mode + telemetry lock sync)
- * - Primary Remote Start & Stop Switch (`remote_start` with default preset / `remote_stop`)
- * - Additional Climate Preset Switches (`remote_start` with specific preset / `remote_stop`)
- * - Optional Tailgate Unlock Switch (`unlock` with `TAILGATE_DOOR`)
+ * - Lock Doors / Unlock Doors buttons (`lock` / `unlock` with configurable door mode)
+ * - Remote Start buttons, one per configured climate preset (`remote_start`)
+ * - Stop Engine button (`remote_stop`)
+ * - Optional Tailgate Unlock button (`unlock` with `TAILGATE_DOOR`)
  * - Optional Flash Lights Switch (`lights` / `lights_stop`)
  * - Optional Panic Horn Switch (`horn` / `horn_stop`)
- * - Optional Force Vehicle Wake & Poll Switch (`update` + `fetch`)
- * - Optional PHEV Charge Start Switch (`charge_start`)
+ * - Optional Force Vehicle Wake & Poll button (`update` + `fetch`)
+ * - Optional PHEV Charge Start button (`charge_start`)
  * - EV Battery Service (for Crosstrek PHEV / EV models)
  * - Door, Trunk, Hood & Power Window / Sunroof Contact Sensors
  * - Optional Exterior Temperature Sensor (if reported by vehicle/API in °C)
  *
+ * Lock/unlock and engine start/stop are stateless momentary buttons: the plugin
+ * does not track or display whether the car is locked or running (MySubaru's
+ * cached status lags reality and showed "Locked" for unlocked cars). Pressing a
+ * button fires the command in the background and the button flips back to Off.
+ *
  * Every remote command is fire-and-forget: HomeKit `onSet` handlers return
  * immediately and the command runs in the background through an
- * {@link IntentRunner}. State is updated when MySubaru confirms (or rolled back
- * when it fails). Repeated writes for a command already in flight are dropped,
- * so a slow MySubaru round trip can never turn into duplicate commands.
+ * {@link IntentRunner}, then the account-wide command queue. Repeated presses
+ * while a command is in flight are dropped, so a slow MySubaru round trip can
+ * never turn into duplicate commands.
  */
 export class SubaruVehicleAccessory {
-  private lockService?: Service;
-  private primaryResSwitch?: Service;
-  private presetSwitches = new Map<string, Service>();
+  private lockButton?: Service;
+  private unlockButton?: Service;
+  private stopEngineButton?: Service;
+  private startButtons = new Map<string, Service>();
   private tailgateSwitch?: Service;
   private lightsSwitch?: Service;
   private hornSwitch?: Service;
@@ -67,19 +74,14 @@ export class SubaruVehicleAccessory {
   private tempSensorService?: Service;
   private contactSensors = new Map<string, Service>();
 
-  // Internal states
-  private lockTargetState: number;
-  private lockCurrentState: number;
-  private readonly lockRunner: IntentRunner<number>;
+  // Command runners (in-flight tracking only; no vehicle lock/engine state is kept)
+  private readonly lockRunner: IntentRunner<LockIntent>;
   private readonly engineRunner: IntentRunner<EngineIntent>;
   private readonly lightsRunner: IntentRunner<boolean>;
   private readonly hornRunner: IntentRunner<boolean>;
   private readonly tailgateRunner: IntentRunner<true>;
   private readonly evChargeRunner: IntentRunner<true>;
   private readonly wakeRunner: IntentRunner<true>;
-  private engineRunning = false;
-  private activePreset: string | null = null;
-  private engineTimer?: NodeJS.Timeout;
   private lightsTimer?: NodeJS.Timeout;
   private lightsActive = false;
   private hornActive = false;
@@ -93,22 +95,41 @@ export class SubaruVehicleAccessory {
   ) {
     const { Service, Characteristic } = this.platform;
 
-    this.lockTargetState = Characteristic.LockTargetState.SECURED;
-    this.lockCurrentState = Characteristic.LockCurrentState.SECURED;
-
     const onCallbackError = (err: unknown) =>
       this.platform.log.error(`[${this.vehicle.name}] Internal state update failed: ${formatLogError(err)}`);
 
-    this.lockRunner = new IntentRunner<number>({
-      execute: (target) => this.sendLockCommand(target),
-      onSuccess: (target) => this.onLockSucceeded(target),
-      onFailure: (target, err) => this.onLockFailed(target, err),
+    this.lockRunner = new IntentRunner<LockIntent>({
+      execute: (intent) =>
+        intent === 'lock'
+          ? this.sendSimpleCommand('lock')
+          : this.sendSimpleCommand('unlock', { door: this.unlockMode() }),
+      onSuccess: (intent) =>
+        this.platform.log.info(
+          intent === 'lock'
+            ? `[${this.vehicle.name}] Vehicle locked.`
+            : `[${this.vehicle.name}] Vehicle unlocked (${this.unlockMode()}).`,
+        ),
+      onFailure: (intent, err) =>
+        this.platform.log.error(
+          `[${this.vehicle.name}] ${intent === 'lock' ? 'Lock' : 'Unlock'} command failed: ${formatLogError(err)}`,
+        ),
       onCallbackError,
     });
     this.engineRunner = new IntentRunner<EngineIntent>({
-      execute: (intent) => this.sendEngineCommand(intent),
-      onSuccess: (intent) => this.onEngineSucceeded(intent),
-      onFailure: (intent, err) => this.onEngineFailed(intent, err),
+      execute: (intent) =>
+        intent.kind === 'start'
+          ? this.sendSimpleCommand('remote_start', { preset: intent.preset })
+          : this.sendSimpleCommand('remote_stop'),
+      onSuccess: (intent) =>
+        this.platform.log.info(
+          intent.kind === 'start'
+            ? `[${this.vehicle.name}] Remote start (${intent.preset}) confirmed.`
+            : `[${this.vehicle.name}] Engine stopped.`,
+        ),
+      onFailure: (intent, err) =>
+        this.platform.log.error(
+          `[${this.vehicle.name}] ${intent.kind === 'start' ? `Remote start (${intent.preset})` : 'Remote stop'} failed: ${formatLogError(err)}`,
+        ),
       isSame: (a, b) =>
         a.kind === b.kind && (a.kind === 'stop' || a.preset === (b as { preset: string }).preset),
       onCallbackError,
@@ -177,44 +198,63 @@ export class SubaruVehicleAccessory {
       .setCharacteristic(Characteristic.SerialNumber, this.vehicle.vin)
       .setCharacteristic(Characteristic.FirmwareRevision, this.vehicle.api_gen);
 
-    // 2. Door Lock Service (if vehicle has remote capability)
+    // 2. Lock / Unlock buttons (stateless). The old stateful LockMechanism is removed:
+    //    MySubaru's cached lock status lags reality, so HomeKit showed wrong lock states.
+    for (const svc of [...this.accessory.services]) {
+      if (svc.UUID === Service.LockMechanism.UUID) {
+        this.accessory.removeService(svc);
+      }
+    }
     if (this.vehicle.has_remote) {
-      const lockName = sanitizeHapName(`${this.vehicle.name} Doors`);
-      this.lockService =
-        this.accessory.getServiceById(Service.LockMechanism, 'lock-doors') ||
-        this.accessory.getService(Service.LockMechanism) ||
-        this.accessory.addService(Service.LockMechanism, lockName, 'lock-doors');
+      this.lockButton = this.getOrAddService(Service.Switch, `${this.vehicle.name} Lock Doors`, 'button-lock');
+      this.lockButton
+        .getCharacteristic(Characteristic.On)
+        .onGet(() => false)
+        .onSet((val) => this.pressButton(val, this.lockButton, 'lock', () => this.lockRunner.request('lock')));
 
-      this.configureServiceName(this.lockService, lockName);
-
-      this.lockService
-        .getCharacteristic(Characteristic.LockCurrentState)
-        .onGet(() => this.lockCurrentState);
-
-      this.lockService
-        .getCharacteristic(Characteristic.LockTargetState)
-        .onGet(() => this.lockTargetState)
-        .onSet(this.handleLockTargetSet.bind(this));
+      this.unlockButton = this.getOrAddService(
+        Service.Switch,
+        `${this.vehicle.name} Unlock Doors`,
+        'button-unlock',
+      );
+      this.unlockButton
+        .getCharacteristic(Characteristic.On)
+        .onGet(() => false)
+        .onSet((val) =>
+          this.pressButton(val, this.unlockButton, 'unlock', () => this.lockRunner.request('unlock')),
+        );
     } else {
-      this.removeServiceIfPresent(Service.LockMechanism, 'lock-doors');
+      this.removeServiceIfPresent(Service.Switch, 'button-lock');
+      this.removeServiceIfPresent(Service.Switch, 'button-unlock');
     }
 
-    // 3. Remote Engine / Climate Start Switches (if vehicle has RES or is EV)
+    // 3. Remote Start buttons (one per climate preset) + Stop Engine button (if vehicle has RES or is EV)
     const activePresetSubtypes = new Set<string>();
     if (this.vehicle.has_res || this.vehicle.is_ev) {
       const defaultPreset = (this.platform.config.defaultPreset || 'Full Heat').trim() || 'Full Heat';
       const primaryName = sanitizeHapName(`${this.vehicle.name} Remote Start - ${defaultPreset}`);
       activePresetSubtypes.add('remote-start-primary');
 
-      this.primaryResSwitch = this.getOrAddService(
-        Service.Switch,
-        primaryName,
-        'remote-start-primary',
-      );
-      this.primaryResSwitch
+      const primary = this.getOrAddService(Service.Switch, primaryName, 'remote-start-primary');
+      primary
         .getCharacteristic(Characteristic.On)
-        .onGet(() => this.isPresetOn(defaultPreset))
-        .onSet((val) => this.handleRemoteStartSet(defaultPreset, val));
+        .onGet(() => false)
+        .onSet((val) => this.pressStart(val, primary, defaultPreset));
+      this.startButtons.set(defaultPreset, primary);
+
+      this.stopEngineButton = this.getOrAddService(
+        Service.Switch,
+        `${this.vehicle.name} Stop Engine`,
+        'button-remote-stop',
+      );
+      this.stopEngineButton
+        .getCharacteristic(Characteristic.On)
+        .onGet(() => false)
+        .onSet((val) =>
+          this.pressButton(val, this.stopEngineButton, 'remote stop', () =>
+            this.engineRunner.request({ kind: 'stop' }),
+          ),
+        );
 
       // Additional Preset Switches
       const extraPresets = this.platform.config.additionalPresets || [];
@@ -240,11 +280,13 @@ export class SubaruVehicleAccessory {
         const svc = this.getOrAddService(Service.Switch, switchName, subType);
         svc
           .getCharacteristic(Characteristic.On)
-          .onGet(() => this.isPresetOn(cleanPreset))
-          .onSet((val) => this.handleRemoteStartSet(cleanPreset, val));
+          .onGet(() => false)
+          .onSet((val) => this.pressStart(val, svc, cleanPreset));
 
-        this.presetSwitches.set(cleanPreset, svc);
+        this.startButtons.set(cleanPreset, svc);
       }
+    } else {
+      this.removeServiceIfPresent(Service.Switch, 'button-remote-stop');
     }
 
     // Prune any stale cached remote-start switches no longer configured
@@ -356,10 +398,6 @@ export class SubaruVehicleAccessory {
   }
 
   public dispose(): void {
-    if (this.engineTimer) {
-      clearTimeout(this.engineTimer);
-      this.engineTimer = undefined;
-    }
     if (this.lightsTimer) {
       clearTimeout(this.lightsTimer);
       this.lightsTimer = undefined;
@@ -426,181 +464,41 @@ export class SubaruVehicleAccessory {
     }
   }
 
-  // ---- Door lock ---------------------------------------------------------
-
-  /** HomeKit write handler: returns immediately; the command runs in the background. */
-  private handleLockTargetSet(value: CharacteristicValue): void {
-    const target = Number(value);
-    this.lockTargetState = target;
-    const label = this.isSecuredTarget(target) ? 'lock' : 'unlock';
-    this.logOutcome(this.lockRunner.request(target), label);
+  private unlockMode(): string {
+    return this.platform.config.unlockMode || 'ALL_DOORS';
   }
 
-  private isSecuredTarget(target: number): boolean {
-    return target === this.platform.Characteristic.LockTargetState.SECURED;
-  }
-
-  private async sendLockCommand(target: number): Promise<void> {
-    if (this.isSecuredTarget(target)) {
-      await this.sendSimpleCommand('lock');
-    } else {
-      const unlockMode = this.platform.config.unlockMode || 'ALL_DOORS';
-      await this.sendSimpleCommand('unlock', { door: unlockMode });
-    }
-  }
-
-  private onLockSucceeded(target: number): void {
-    const { Characteristic } = this.platform;
-    const secured = this.isSecuredTarget(target);
-    this.lockCurrentState = secured
-      ? Characteristic.LockCurrentState.SECURED
-      : Characteristic.LockCurrentState.UNSECURED;
-    this.lockService?.updateCharacteristic(Characteristic.LockCurrentState, this.lockCurrentState);
-    if (!this.lockRunner.busy) {
-      this.lockTargetState = target;
-      this.lockService?.updateCharacteristic(Characteristic.LockTargetState, this.lockTargetState);
-    }
-    const mode = secured ? '' : ` (${this.platform.config.unlockMode || 'ALL_DOORS'})`;
-    this.platform.log.info(`[${this.vehicle.name}] Vehicle ${secured ? 'locked' : 'unlocked'}${mode}.`);
-  }
-
-  private onLockFailed(target: number, err: unknown): void {
-    const { Characteristic } = this.platform;
-    const label = this.isSecuredTarget(target) ? 'Lock' : 'Unlock';
-    this.platform.log.error(`[${this.vehicle.name}] ${label} command failed: ${formatLogError(err)}`);
-    if (this.lockRunner.busy) {
-      return; // a newer queued request is about to run and will set the state
-    }
-    // Roll the target back to the last confirmed state so HomeKit stops showing "Locking…/Unlocking…".
-    this.lockTargetState =
-      this.lockCurrentState === Characteristic.LockCurrentState.UNSECURED
-        ? Characteristic.LockTargetState.UNSECURED
-        : Characteristic.LockTargetState.SECURED;
-    this.lockService?.updateCharacteristic(Characteristic.LockTargetState, this.lockTargetState);
-    // The car may still have acted (e.g. MySubaru timed out confirming), so resync from telemetry.
-    void this.refreshTelemetry({ force: true });
-  }
-
-  // ---- Remote engine start / stop ---------------------------------------
-
-  /** HomeKit write handler: returns immediately; the command runs in the background. */
-  private handleRemoteStartSet(presetName: string, value: CharacteristicValue): void {
-    const turnOn = Boolean(value);
-    if (turnOn && !this.engineRunner.busy && this.engineRunning && this.activePreset === presetName) {
-      this.platform.log.info(
-        `[${this.vehicle.name}] Remote start (${presetName}) is already running; not sending it again.`,
-      );
-      return;
-    }
-    const intent: EngineIntent = turnOn ? { kind: 'start', preset: presetName } : { kind: 'stop' };
-    const label = turnOn ? `remote start (${presetName})` : 'remote stop';
-    this.logOutcome(this.engineRunner.request(intent), label);
-    this.syncRemoteStartSwitches();
-  }
-
-  private async sendEngineCommand(intent: EngineIntent): Promise<void> {
-    if (intent.kind === 'start') {
-      await this.sendSimpleCommand('remote_start', { preset: intent.preset });
-    } else {
-      await this.sendSimpleCommand('remote_stop');
-    }
-  }
-
-  private onEngineSucceeded(intent: EngineIntent): void {
-    if (this.engineTimer) {
-      clearTimeout(this.engineTimer);
-      this.engineTimer = undefined;
-    }
-    if (intent.kind === 'stop') {
-      this.engineRunning = false;
-      this.activePreset = null;
-      this.platform.log.info(`[${this.vehicle.name}] Engine stopped.`);
-    } else {
-      this.engineRunning = true;
-      this.activePreset = intent.preset;
-      const runMinutes = Math.max(1, Math.min(20, this.platform.config.engineRunDurationMinutes ?? 10));
-      this.engineTimer = setTimeout(() => {
-        this.platform.log.debug(
-          `[${this.vehicle.name}] Remote start ${runMinutes}-minute cycle finished; resetting HomeKit switch state to Off.`,
-        );
-        this.engineRunning = false;
-        this.activePreset = null;
-        this.syncRemoteStartSwitches();
-      }, runMinutes * 60 * 1000);
-      this.engineTimer.unref?.();
-      this.platform.log.info(
-        `[${this.vehicle.name}] Remote start (${intent.preset}) active for ${runMinutes}m.`,
-      );
-      this.markLockedByRemoteStart();
-    }
-    this.syncRemoteStartSwitches();
-  }
+  // ---- Momentary buttons ---------------------------------------------------
 
   /**
-   * Remote start locks the doors. Reflect that in HomeKit, unless a lock/unlock
-   * request is still pending (e.g. the unlock queued behind this start), which
-   * will set the final state itself.
+   * HomeKit write handler for a momentary button: on press, requests the command
+   * (which runs in the background) and flips the button back to Off. Turning a
+   * button Off does nothing. Never awaits MySubaru.
    */
-  private markLockedByRemoteStart(): void {
-    if (!this.lockService || this.lockRunner.busy) {
-      return;
-    }
-    const { Characteristic } = this.platform;
-    this.lockCurrentState = Characteristic.LockCurrentState.SECURED;
-    this.lockTargetState = Characteristic.LockTargetState.SECURED;
-    this.lockService.updateCharacteristic(Characteristic.LockCurrentState, this.lockCurrentState);
-    this.lockService.updateCharacteristic(Characteristic.LockTargetState, this.lockTargetState);
-    this.platform.log.info(`[${this.vehicle.name}] Remote start locked the doors; lock shows Locked.`);
-  }
-
-  private onEngineFailed(intent: EngineIntent, err: unknown): void {
-    const label = intent.kind === 'start' ? `Remote start (${intent.preset})` : 'Remote stop';
-    this.platform.log.error(`[${this.vehicle.name}] ${label} failed: ${formatLogError(err)}`);
-    // Engine state is unchanged; switches fall back to the last confirmed state.
-    this.syncRemoteStartSwitches();
-  }
-
-  /** A preset switch shows On while its start is pending, or while it is confirmed running. */
-  private isPresetOn(preset: string): boolean {
-    const latest = this.engineRunner.latest;
-    if (latest) {
-      return latest.kind === 'start' && latest.preset === preset;
-    }
-    return this.engineRunning && this.activePreset === preset;
-  }
-
-  private syncRemoteStartSwitches(): void {
-    const { Characteristic } = this.platform;
-    const defaultPreset = (this.platform.config.defaultPreset || 'Full Heat').trim() || 'Full Heat';
-
-    this.primaryResSwitch?.updateCharacteristic(Characteristic.On, this.isPresetOn(defaultPreset));
-
-    for (const [preset, svc] of this.presetSwitches.entries()) {
-      svc.updateCharacteristic(Characteristic.On, this.isPresetOn(preset));
-    }
-  }
-
-  // ---- Momentary switches (tailgate, wake/poll, EV charge) ---------------
-
-  /** Fires a one-shot command in the background and flips the switch back to Off. */
-  private triggerMomentary(
+  private pressButton(
     value: CharacteristicValue,
-    runner: IntentRunner<true>,
     service: Service | undefined,
     label: string,
+    request: () => IntentOutcome,
   ): void {
     if (!value) {
       return;
     }
-    this.logOutcome(runner.request(true), label);
+    this.logOutcome(request(), label);
     const t = setTimeout(() => {
       service?.updateCharacteristic(this.platform.Characteristic.On, false);
     }, MOMENTARY_RESET_MS);
     t.unref?.();
   }
 
+  private pressStart(value: CharacteristicValue, service: Service, preset: string): void {
+    this.pressButton(value, service, `remote start (${preset})`, () =>
+      this.engineRunner.request({ kind: 'start', preset }),
+    );
+  }
+
   private handleTailgateUnlock(value: CharacteristicValue): void {
-    this.triggerMomentary(value, this.tailgateRunner, this.tailgateSwitch, 'tailgate unlock');
+    this.pressButton(value, this.tailgateSwitch, 'tailgate unlock', () => this.tailgateRunner.request(true));
   }
 
   private handleForceWakePoll(value: CharacteristicValue): void {
@@ -609,11 +507,11 @@ export class SubaruVehicleAccessory {
         `[${this.vehicle.name}] Waking vehicle telematics module (Controller.update) to pull fresh sensor status...`,
       );
     }
-    this.triggerMomentary(value, this.wakeRunner, this.locateSwitch, 'vehicle wake/poll');
+    this.pressButton(value, this.locateSwitch, 'vehicle wake/poll', () => this.wakeRunner.request(true));
   }
 
   private handleEvChargeStart(value: CharacteristicValue): void {
-    this.triggerMomentary(value, this.evChargeRunner, this.evChargeSwitch, 'EV charge start');
+    this.pressButton(value, this.evChargeSwitch, 'EV charge start', () => this.evChargeRunner.request(true));
   }
 
   // ---- Lights & horn -----------------------------------------------------
@@ -720,31 +618,9 @@ export class SubaruVehicleAccessory {
         }
       }
 
-      // 3. Sync Lock Mechanism State if vehicle reports valid LOCKED / UNLOCKED status
-      if (this.lockService && !this.lockRunner.busy && telemetry.locks) {
-        const lockValues = Object.values(telemetry.locks)
-          .map((v) => v.toUpperCase())
-          .filter((v) => v === 'LOCKED' || v === 'UNLOCKED');
-        if (lockValues.length > 0) {
-          const anyUnlocked = lockValues.includes('UNLOCKED');
-          this.lockCurrentState = anyUnlocked
-            ? Characteristic.LockCurrentState.UNSECURED
-            : Characteristic.LockCurrentState.SECURED;
-          this.lockTargetState = anyUnlocked
-            ? Characteristic.LockTargetState.UNSECURED
-            : Characteristic.LockTargetState.SECURED;
-          this.lockService.updateCharacteristic(
-            Characteristic.LockCurrentState,
-            this.lockCurrentState,
-          );
-          this.lockService.updateCharacteristic(
-            Characteristic.LockTargetState,
-            this.lockTargetState,
-          );
-        }
-      }
+      // (Lock status is intentionally not shown: MySubaru's cached value lags reality.)
 
-      // 4. Update Exterior Temperature Sensor if reported (strictly °C within HAP bounds [-270, 100])
+      // 3. Update Exterior Temperature Sensor if reported (strictly °C within HAP bounds [-270, 100])
       if (typeof telemetry.external_temp === 'number' && Number.isFinite(telemetry.external_temp)) {
         const clampedTempC = Math.max(-270, Math.min(100, telemetry.external_temp));
         if (!this.tempSensorService) {
