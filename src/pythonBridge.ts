@@ -6,6 +6,7 @@ import {
   DiscoveredVehicle,
   formatLogError,
   maskIdentifier,
+  redactVins,
   SubaruLinkConfig,
   VehicleTelemetry,
 } from './settings';
@@ -159,9 +160,9 @@ export class SubaruPythonBridge {
           .filter(Boolean);
         for (const line of lines) {
           if (isErr) {
-            this.log.debug('[bootstrap]', line);
+            this.log.debug('[bootstrap]', redactVins(line));
           } else {
-            this.log.debug(line.replace(/^\[homebridge-subarulink:bootstrap\]\s*/, ''));
+            this.log.debug(redactVins(line.replace(/^\[homebridge-subarulink:bootstrap\]\s*/, '')));
           }
         }
       };
@@ -325,7 +326,7 @@ export class SubaruPythonBridge {
             }
           }
         } catch {
-          this.log.debug('[Python stdout]', line);
+          this.log.debug('[Python stdout]', redactVins(line));
         }
       }
     });
@@ -333,7 +334,8 @@ export class SubaruPythonBridge {
     child.stderr.on('data', (chunk: Buffer) => {
       const msg = chunk.toString('utf8').trim();
       if (msg) {
-        this.log.debug('[subarulink-python]', msg);
+        // subarulink's own warnings can include request URLs with ?vin=...
+        this.log.debug('[subarulink-python]', redactVins(msg));
       }
     });
 
