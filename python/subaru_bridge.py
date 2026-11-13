@@ -70,6 +70,13 @@ def _strip_html_markup(text: str) -> str:
     return re.sub(r"[<>]", "", current)
 
 
+# 17-character VIN (no I, O or Q) containing at least one digit and one letter.
+_VIN_PATTERN = re.compile(
+    r"\b(?=[A-HJ-NPR-Z0-9]{0,16}\d)(?=[A-HJ-NPR-Z0-9]{0,16}[A-HJ-NPR-Z])[A-HJ-NPR-Z0-9]{17}\b",
+    re.IGNORECASE,
+)
+
+
 def _sanitize_error_message(raw_msg: str) -> str:
     """
     Strips multi-line HTML error pages, aiohttp RequestInfo dumps (which may contain
@@ -107,6 +114,7 @@ def _sanitize_error_message(raw_msg: str) -> str:
     msg = re.sub(r"\s+", " ", msg).strip().rstrip(":")
     if endpoint:
         msg = f"{msg} [{endpoint}]"
+    msg = _VIN_PATTERN.sub("[VIN]", msg)
     if len(msg) > 220:
         msg = msg[:217] + "..."
     return msg or "Unknown error"

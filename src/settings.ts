@@ -39,8 +39,26 @@ function stripHtmlMarkup(input: string): string {
 }
 
 /**
+ * A 17-character VIN (letters and digits, never I, O or Q) containing at least one
+ * digit and one letter, so ordinary words and numbers are left alone.
+ */
+const VIN_PATTERN =
+  /\b(?=[A-HJ-NPR-Z0-9]{0,16}\d)(?=[A-HJ-NPR-Z0-9]{0,16}[A-HJ-NPR-Z])[A-HJ-NPR-Z0-9]{17}\b/gi;
+
+/** Replaces any VIN in log text with `[VIN]`. */
+export function redactVins(text: string): string {
+  return text.replace(VIN_PATTERN, '[VIN]');
+}
+
+/** Shows only the last 4 characters of an identifier (e.g. the MySubaru device ID) in logs. */
+export function maskIdentifier(id: unknown): string {
+  const s = String(id ?? '');
+  return s.length > 4 ? `…${s.slice(-4)}` : '…';
+}
+
+/**
  * Strips multi-line HTML error bodies, aiohttp RequestInfo dumps (containing cookies/headers),
- * and collapses whitespace so Homebridge logs stay concise and single-line.
+ * and VINs, and collapses whitespace so Homebridge logs stay concise and single-line.
  */
 export function formatLogError(err: unknown): string {
   const raw =
@@ -82,6 +100,7 @@ export function formatLogError(err: unknown): string {
   if (endpoint && !msg.includes(endpoint)) {
     msg = `${msg} [${endpoint}]`;
   }
+  msg = redactVins(msg);
   if (msg.length > 220) {
     msg = `${msg.slice(0, 217)}...`;
   }
@@ -100,6 +119,8 @@ export interface SubaruLinkConfig extends PlatformConfig {
   defaultPreset?: string;
   additionalPresets?: string[];
   engineRunDurationMinutes?: number;
+  /** Seconds to wait after one remote command finishes before sending the next (default 2). */
+  commandGapSeconds?: number;
   unlockMode?: 'ALL_DOORS' | 'DRIVERS_DOOR' | 'TAILGATE_DOOR';
   exposeTailgateUnlockSwitch?: boolean;
   exposeHornSwitch?: boolean;

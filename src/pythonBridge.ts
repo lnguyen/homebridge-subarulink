@@ -5,6 +5,7 @@ import { Logger } from 'homebridge';
 import {
   DiscoveredVehicle,
   formatLogError,
+  maskIdentifier,
   SubaruLinkConfig,
   VehicleTelemetry,
 } from './settings';
@@ -224,7 +225,7 @@ export class SubaruPythonBridge {
 
       if (initResult.status === '2fa_required') {
         this.log.warn(
-          `MySubaru 2FA is required for Device ID ${initParams.device_id}. Available contact methods: ${JSON.stringify(initResult.contact_methods)}. Enter one under "2FA Contact Method" in plugin settings and restart Homebridge.`,
+          `MySubaru 2FA is required for Device ID ${maskIdentifier(initParams.device_id)}. Available contact methods: ${JSON.stringify(initResult.contact_methods)}. Enter one under "2FA Contact Method" in plugin settings and restart Homebridge.`,
         );
         return false;
       }
@@ -249,7 +250,7 @@ export class SubaruPythonBridge {
       this.initialized = true;
       if (isInitialStart) {
         this.log.info(
-          `Connected to MySubaru API (subarulink v${initResult.version}, Device ID: ${initParams.device_id})`,
+          `Connected to MySubaru API (subarulink v${initResult.version}, Device ID: ${maskIdentifier(initParams.device_id)})`,
         );
       } else {
         this.log.debug(

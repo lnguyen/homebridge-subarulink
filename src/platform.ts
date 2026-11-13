@@ -14,14 +14,20 @@ import {
   SubaruLinkConfig,
   sanitizeHapName,
 } from './settings';
+import { CommandQueue } from './commandQueue';
 import { SubaruPythonBridge } from './pythonBridge';
 import { SubaruVehicleAccessory } from './platformAccessory';
+
+/** Default pause between one remote command finishing and the next being sent. */
+export const DEFAULT_COMMAND_GAP_SECONDS = 2;
 
 export class SubaruLinkPlatform implements DynamicPlatformPlugin {
   public readonly Service: typeof Service;
   public readonly Characteristic: typeof Characteristic;
   public readonly accessories: PlatformAccessory[] = [];
   public bridge!: SubaruPythonBridge;
+  /** Serializes remote commands across all vehicles on the account. */
+  public readonly commandQueue: CommandQueue;
   private pollTimer?: NodeJS.Timeout;
   private wakeTimer?: NodeJS.Timeout;
   private activeAccessories = new Map<string, SubaruVehicleAccessory>();
@@ -33,6 +39,15 @@ export class SubaruLinkPlatform implements DynamicPlatformPlugin {
   ) {
     this.Service = this.api.hap.Service;
     this.Characteristic = this.api.hap.Characteristic;
+
+    const gapSeconds = Number(this.config?.commandGapSeconds ?? DEFAULT_COMMAND_GAP_SECONDS);
+    this.commandQueue = new CommandQueue({
+      minGapMs: Number.isFinite(gapSeconds) && gapSeconds >= 0 ? gapSeconds * 1000 : DEFAULT_COMMAND_GAP_SECONDS * 1000,
+      onQueued: (label, ahead) =>
+        this.log.info(
+          `${label} queued behind ${ahead} other command(s); it will be sent when they finish.`,
+        ),
+    });
 
     if (!this.config || !this.config.username || !this.config.password || !this.config.pin) {
       this.log.warn(
@@ -95,7 +110,7 @@ export class SubaruLinkPlatform implements DynamicPlatformPlugin {
 
     if (!targetVehicles.length) {
       this.log.warn(
-        `No matching active vehicles found (configured VIN: ${configuredVin || 'All'}). Falling back to all discovered vehicles.`,
+        `No matching active vehicles found (${configuredVin ? 'for the configured VIN' : 'with an active subscription'}). Falling back to all discovered vehicles.`,
       );
       targetVehicles.push(...vehicles);
     }
@@ -109,7 +124,7 @@ export class SubaruLinkPlatform implements DynamicPlatformPlugin {
       const existingAccessory = this.accessories.find((acc) => acc.UUID === uuid);
       if (existingAccessory) {
         this.log.info(
-          `Restoring existing vehicle accessory: ${vehicle.name} (${vehicle.vin})`,
+          `Restoring existing vehicle accessory: ${vehicle.name}`,
         );
         existingAccessory.context.vehicle = vehicle;
         const handler = new SubaruVehicleAccessory(this, existingAccessory, vehicle);
@@ -117,7 +132,7 @@ export class SubaruLinkPlatform implements DynamicPlatformPlugin {
         this.api.updatePlatformAccessories([existingAccessory]);
       } else {
         this.log.info(
-          `Adding new vehicle accessory: ${vehicle.name} (${vehicle.model_year} ${vehicle.model_name} - ${vehicle.vin})`,
+          `Adding new vehicle accessory: ${vehicle.name} (${vehicle.model_year} ${vehicle.model_name})`,
         );
         const safeName = sanitizeHapName(vehicle.name, 'Subaru');
         const accessory = new this.api.platformAccessory(safeName, uuid);

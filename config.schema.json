@@ -85,6 +85,14 @@
         "maximum": 20,
         "description": "Starlink remote start runs the engine for 10 minutes by default. The HomeKit switch will automatically revert to 'Off' after this timer expires unless turned off manually earlier (which sends remote_stop)."
       },
+      "commandGapSeconds": {
+        "title": "Pause Between Queued Remote Commands (Seconds)",
+        "type": "number",
+        "default": 2,
+        "minimum": 0,
+        "maximum": 30,
+        "description": "MySubaru runs one remote command at a time. When several are triggered together (e.g. an automation that starts the engine and unlocks the doors), they are queued and sent one after another, waiting this long after each finishes."
+      },
       "unlockMode": {
         "title": "Default Door Unlock Target",
         "type": "string",
@@ -178,6 +186,7 @@
       "title": "Doors, Sensors & Feature Switches",
       "items": [
         "unlockMode",
+        "commandGapSeconds",
         "exposeTailgateUnlockSwitch",
         "exposeLightsSwitch",
         "exposeHornSwitch",

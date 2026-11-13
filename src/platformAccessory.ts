@@ -145,8 +145,12 @@ export class SubaruVehicleAccessory {
       onCallbackError,
     });
     this.wakeRunner = new IntentRunner<true>({
+      // Waking the car is a remote command too, so it waits its turn in the queue.
       // refreshTelemetry logs its own failures and never throws.
-      execute: () => this.refreshTelemetry({ wake: true, force: true }),
+      execute: () =>
+        this.platform.commandQueue.run(`[${this.vehicle.name}] vehicle wake/poll`, () =>
+          this.refreshTelemetry({ wake: true, force: true }),
+        ),
       onSuccess: () => undefined,
       onFailure: () => undefined,
       onCallbackError,
@@ -379,13 +383,19 @@ export class SubaruVehicleAccessory {
     }
   }
 
-  /** Sends the command through the bridge; throws if MySubaru did not confirm it. */
+  /**
+   * Sends the command through the account-wide queue (one MySubaru command at a
+   * time, with a pause between them); throws if MySubaru did not confirm it.
+   */
   private async sendSimpleCommand(
     command: Parameters<SubaruLinkPlatform['bridge']['executeCommand']>[1],
     args: Record<string, unknown> = {},
   ): Promise<void> {
-    this.platform.log.info(`[${this.vehicle.name}] Sending ${command} command...`);
-    const ok = await this.platform.bridge.executeCommand(this.vehicle.vin, command, args);
+    const label = `[${this.vehicle.name}] ${command}`;
+    const ok = await this.platform.commandQueue.run(label, () => {
+      this.platform.log.info(`[${this.vehicle.name}] Sending ${command} command...`);
+      return this.platform.bridge.executeCommand(this.vehicle.vin, command, args);
+    });
     if (!ok) {
       throw new Error(`MySubaru did not confirm the ${command} command`);
     }
@@ -613,7 +623,11 @@ export class SubaruVehicleAccessory {
   }
 
   public async refreshTelemetry(options: { wake?: boolean; force?: boolean } = {}): Promise<void> {
-    if (!options.wake && !options.force && this.platform.bridge.hasActiveCommand()) {
+    if (
+      !options.wake &&
+      !options.force &&
+      (this.platform.commandQueue.busy || this.platform.bridge.hasActiveCommand())
+    ) {
       this.platform.log.debug(
         `[${this.vehicle.name}] Deferring background cache poll while a remote command is in flight.`,
       );

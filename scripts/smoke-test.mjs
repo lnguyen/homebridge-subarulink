@@ -17,6 +17,8 @@
  * 5. Fire-and-forget remote commands: HomeKit writes return immediately, repeated writes while a
  *    command is in flight send nothing extra, queued opposite requests run in order, and lock /
  *    remote-start state follows MySubaru confirmations (rolled back on failure).
+ * 6. Account-wide command queue: simultaneous commands (e.g. start + unlock from one automation)
+ *    reach MySubaru one at a time with `commandGapSeconds` between them; failures do not block.
  */
 
 import assert from 'node:assert/strict';
@@ -120,6 +122,28 @@ print(json.dumps(info))
   assert.deepEqual(audit.remote_start_params, ['self', 'vin', 'preset_name']);
   assert.equal(audit.vehicle_status_const, 'vehicle_status');
   assert.ok(audit.vehicle_info_keys.includes('vehicle_status'));
+  // The Python daemon's error sanitizer must redact VINs before anything reaches stderr/Homebridge logs.
+  const redactionJson = execFileSync(
+    VENV_PYTHON,
+    [
+      '-c',
+      `
+import json, sys
+sys.path.insert(0, ${JSON.stringify(path.join(PLUGIN_ROOT, 'python'))})
+import subaru_bridge as b
+print(json.dumps({
+    "vin": b._sanitize_error_message("Invalid VIN: JF2BTANC0R0000001 RequestInfo(url=URL('https://x/g2v33/selectVehicle.json?vin=jf2btanc0r0000001'))"),
+    "plain": b._sanitize_error_message("took 12345678901234567 ms"),
+}))
+`,
+    ],
+    { encoding: 'utf8' },
+  ).trim();
+  const redaction = JSON.parse(redactionJson);
+  assert.ok(!/JF2BTANC0R0000001/i.test(redaction.vin), `VIN leaked from Python sanitizer: ${redaction.vin}`);
+  assert.ok(redaction.vin.includes('[VIN]'), 'Python sanitizer should replace VINs with [VIN]');
+  assert.equal(redaction.plain, 'took 12345678901234567 ms', 'All-digit numbers are not mistaken for VINs');
+
   console.log(
     `   ✓ Verified Python ${audit.python_version.join('.')} + subarulink v${audit.subarulink_version} API signatures & constants`,
   );
@@ -749,6 +773,20 @@ async function testHomebridgeV2CachedAccessoryRestart() {
     assert.ok(!sanitizedNested.toLowerCase().includes('<script'), 'Sanitized log error must not contain <script');
     assert.ok(sanitizedNested.includes('502'), 'Sanitized log error should retain readable status summary');
 
+    // VINs must never reach the Homebridge log, whether in messages or endpoint query strings
+    const vinErr = formatLogError(
+      new Error(
+        "SubaruException: Invalid VIN: jf2btanc0r0000001 RequestInfo(url=URL('https://mobileapi.prod.subarucs.com/g2v33/selectVehicle.json?vin=JF2BTANC0R0000001'), method='GET')",
+      ),
+    );
+    assert.ok(!/JF2BTANC0R0000001/i.test(vinErr), `VIN leaked into log: ${vinErr}`);
+    assert.ok(vinErr.includes('[VIN]'), 'VIN should be replaced with [VIN]');
+    assert.equal(
+      formatLogError(new Error('HTTP 500 after 12345678901234567 ms on DEVICE_NOT_AUTHENTICATED')),
+      'HTTP 500 after 12345678901234567 ms on DEVICE_NOT_AUTHENTICATED',
+      'All-digit numbers and words are not mistaken for VINs',
+    );
+
     logger.logs.length = 0;
     platform.bridge.getTelemetry = async () => {
       throw new Error(rawHtmlErr);
@@ -783,47 +821,21 @@ async function testFireAndForgetCommands() {
   const logger = createSilentLogger();
   const platform = new SubaruLinkPlatform(
     logger,
-    { platform: 'SubaruLink', name: 'SubaruLink', defaultPreset: 'Full Heat', additionalPresets: [] },
+    {
+      platform: 'SubaruLink',
+      name: 'SubaruLink',
+      defaultPreset: 'Full Heat',
+      additionalPresets: [],
+      commandGapSeconds: 0, // queue spacing is covered by section 6
+    },
     api,
   );
-
-  // Controllable bridge: every executeCommand stays pending until the test settles it.
-  const calls = [];
-  platform.bridge = {
-    hasActiveCommand: () => calls.some((c) => !c.settled),
-    getTelemetry: async () => ({ vin: 'JF2BTANC0R0000001', raw: {} }),
-    executeCommand: (vin, command, args) =>
-      new Promise((resolve, reject) => {
-        const call = { vin, command, args, settled: false };
-        call.resolve = (v) => {
-          call.settled = true;
-          resolve(v);
-        };
-        call.reject = (e) => {
-          call.settled = true;
-          reject(e);
-        };
-        calls.push(call);
-      }),
-  };
-
-  const vehicle = {
-    vin: 'JF2BTANC0R0000001',
-    name: 'Test Outback',
-    model_year: '2025',
-    model_name: 'Outback',
-    api_gen: 'g3',
-    is_ev: false,
-    has_remote: true,
-    has_res: true,
-  };
-  const accessory = new api.platformAccessory(vehicle.name, api.hap.uuid.generate(`subarulink-${vehicle.vin}`));
-  const handler = new SubaruVehicleAccessory(platform, accessory, vehicle);
+  const { calls } = installControllableBridge(platform);
+  const { handler, accessory } = createTestVehicleAccessory(api, platform);
   const { Service, Characteristic } = api.hap;
   const lock = accessory.getServiceById(Service.LockMechanism, 'lock-doors');
   const target = lock.getCharacteristic(Characteristic.LockTargetState);
   const current = lock.getCharacteristic(Characteristic.LockCurrentState);
-  const settleTick = () => new Promise((r) => setImmediate(r));
 
   // 1. Three back-to-back unlock writes (the reported bug) -> exactly one command.
   const writeStart = Date.now();
@@ -831,6 +843,7 @@ async function testFireAndForgetCommands() {
     await target.handleSetRequest(Characteristic.LockTargetState.UNSECURED);
   }
   assert.ok(Date.now() - writeStart < 500, 'HomeKit writes must return without waiting for MySubaru');
+  await settleTick();
   assert.equal(calls.length, 1, 'Repeated unlock writes while in flight must send only one command');
   assert.equal(calls[0].command, 'unlock');
   assert.deepEqual(calls[0].args, { door: 'ALL_DOORS' });
@@ -847,6 +860,7 @@ async function testFireAndForgetCommands() {
 
   // 2. Failed lock -> state rolls back to the last confirmed state, error logged.
   await target.handleSetRequest(Characteristic.LockTargetState.SECURED);
+  await settleTick();
   assert.equal(calls.length, 2);
   calls[1].resolve(false);
   await handler.lockRunner.whenIdle();
@@ -861,6 +875,7 @@ async function testFireAndForgetCommands() {
   // 3. Lock tapped, then unlock tapped while the lock is in flight -> unlock queued, runs after.
   await target.handleSetRequest(Characteristic.LockTargetState.SECURED);
   await target.handleSetRequest(Characteristic.LockTargetState.UNSECURED);
+  await settleTick();
   assert.equal(calls.length, 3, 'Opposite request is queued, not sent concurrently');
   calls[2].resolve(true);
   await settleTick();
@@ -877,6 +892,7 @@ async function testFireAndForgetCommands() {
     .getCharacteristic(Characteristic.On);
   await primary.handleSetRequest(true);
   await primary.handleSetRequest(true);
+  await settleTick();
   assert.equal(calls.length, 5, 'Repeated remote start writes must send only one command');
   assert.equal(calls[4].command, 'remote_start');
   assert.deepEqual(calls[4].args, { preset: 'Full Heat' });
@@ -888,14 +904,152 @@ async function testFireAndForgetCommands() {
 
   // 5. Successful start, then a repeat On write while running is not re-sent.
   await primary.handleSetRequest(true);
+  await settleTick();
   calls[5].resolve(true);
   await handler.engineRunner.whenIdle();
   assert.equal(primary.value, true);
   await primary.handleSetRequest(true);
+  await settleTick();
   assert.equal(calls.length, 6, 'Start is not re-sent while the engine is confirmed running');
 
   handler.dispose();
   console.log('   ✓ Writes return immediately, duplicates dropped, state follows MySubaru confirmations');
+}
+
+const settleTick = () => new Promise((r) => setImmediate(r));
+const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** Replaces the platform bridge with one whose commands stay pending until the test settles them. */
+function installControllableBridge(platform) {
+  const calls = [];
+  platform.bridge = {
+    hasActiveCommand: () => calls.some((c) => !c.settled),
+    getTelemetry: async () => ({ vin: 'JF2BTANC0R0000001', raw: {} }),
+    executeCommand: (vin, command, args) =>
+      new Promise((resolve, reject) => {
+        const call = { vin, command, args, settled: false, startedAt: Date.now() };
+        call.resolve = (v) => {
+          call.settled = true;
+          call.settledAt = Date.now();
+          resolve(v);
+        };
+        call.reject = (e) => {
+          call.settled = true;
+          call.settledAt = Date.now();
+          reject(e);
+        };
+        calls.push(call);
+      }),
+  };
+  return { calls };
+}
+
+function createTestVehicleAccessory(api, platform) {
+  const vehicle = {
+    vin: 'JF2BTANC0R0000001',
+    name: 'Test Outback',
+    model_year: '2025',
+    model_name: 'Outback',
+    api_gen: 'g3',
+    is_ev: false,
+    has_remote: true,
+    has_res: true,
+  };
+  const accessory = new api.platformAccessory(vehicle.name, api.hap.uuid.generate(`subarulink-${vehicle.vin}`));
+  const handler = new SubaruVehicleAccessory(platform, accessory, vehicle);
+  return { handler, accessory };
+}
+
+/**
+ * An automation that starts the engine and unlocks at the same moment: both
+ * HomeKit writes return immediately, but MySubaru sees one command at a time,
+ * the second only after the first has finished plus the configured gap.
+ */
+async function testCommandQueueSpacing() {
+  console.log('6. Testing account-wide command queue (start + unlock together, spaced apart)...');
+  const GAP_MS = 150;
+  const api = new HomebridgeAPI();
+  const logger = createSilentLogger();
+  const platform = new SubaruLinkPlatform(
+    logger,
+    {
+      platform: 'SubaruLink',
+      name: 'SubaruLink',
+      defaultPreset: 'Full Heat',
+      additionalPresets: [],
+      commandGapSeconds: GAP_MS / 1000,
+    },
+    api,
+  );
+  const { calls } = installControllableBridge(platform);
+  const { handler, accessory } = createTestVehicleAccessory(api, platform);
+  const { Service, Characteristic } = api.hap;
+  const lockTarget = accessory
+    .getServiceById(Service.LockMechanism, 'lock-doors')
+    .getCharacteristic(Characteristic.LockTargetState);
+  const lockCurrent = accessory
+    .getServiceById(Service.LockMechanism, 'lock-doors')
+    .getCharacteristic(Characteristic.LockCurrentState);
+  const primary = accessory
+    .getServiceById(Service.Switch, 'remote-start-primary')
+    .getCharacteristic(Characteristic.On);
+
+  // Automation fires both at once.
+  const writeStart = Date.now();
+  await Promise.all([
+    primary.handleSetRequest(true),
+    lockTarget.handleSetRequest(Characteristic.LockTargetState.UNSECURED),
+  ]);
+  assert.ok(Date.now() - writeStart < 500, 'Both HomeKit writes return immediately');
+  await settleTick();
+  assert.equal(calls.length, 1, 'Only one command is sent to MySubaru at a time');
+  assert.equal(calls[0].command, 'remote_start');
+  assert.ok(platform.commandQueue.busy);
+  assert.ok(
+    logger.logs.some((l) => l.msg.includes('unlock queued behind 1 other command')),
+    'Queued command is logged',
+  );
+  assert.equal(await primary.handleGetRequest(), true, 'Start switch shows On while pending');
+  assert.equal(await lockTarget.handleGetRequest(), Characteristic.LockTargetState.UNSECURED);
+
+  // Start finishes; unlock must wait for the gap before being sent.
+  calls[0].resolve(true);
+  await settleTick();
+  assert.equal(calls.length, 1, 'Next command waits out the gap after the previous one finishes');
+  await sleepMs(GAP_MS + 100);
+  assert.equal(calls.length, 2, 'Queued unlock is sent after the gap');
+  assert.equal(calls[1].command, 'unlock');
+  assert.ok(
+    calls[1].startedAt - calls[0].settledAt >= GAP_MS - 5,
+    `Gap between commands was ${calls[1].startedAt - calls[0].settledAt}ms, expected >= ${GAP_MS}ms`,
+  );
+
+  calls[1].resolve(true);
+  await platform.commandQueue.whenIdle();
+  await handler.lockRunner.whenIdle();
+  assert.equal(primary.value, true, 'Engine confirmed running');
+  assert.equal(lockCurrent.value, Characteristic.LockCurrentState.UNSECURED, 'Doors confirmed unlocked');
+  assert.equal(platform.commandQueue.busy, false);
+
+  // A failed command does not block the ones behind it.
+  await Promise.all([
+    lockTarget.handleSetRequest(Characteristic.LockTargetState.SECURED),
+    primary.handleSetRequest(false),
+  ]);
+  await sleepMs(GAP_MS + 100); // the previous unlock just finished, so the gap applies first
+  assert.equal(calls.length, 3);
+  calls[2].reject(new Error('HTTP 500'));
+  await sleepMs(GAP_MS + 100);
+  assert.equal(calls.length, 4, 'Command behind a failure still runs');
+  assert.equal(calls[3].command, 'remote_stop');
+  calls[3].resolve(true);
+  await platform.commandQueue.whenIdle();
+  await handler.engineRunner.whenIdle();
+  assert.equal(primary.value, false, 'Engine confirmed stopped');
+  assert.equal(lockCurrent.value, Characteristic.LockCurrentState.UNSECURED, 'Failed lock left doors unlocked');
+
+  handler.dispose();
+  console.log(`   ✓ Simultaneous start + unlock sent one at a time with a ${GAP_MS}ms gap; failures do not block`);
 }
 
 async function main() {
@@ -907,6 +1061,7 @@ async function main() {
   await testBridgeLifecycleConcurrencyAndCrashRecovery();
   await testHomebridgeV2CachedAccessoryRestart();
   await testFireAndForgetCommands();
+  await testCommandQueueSpacing();
   console.log('==============================================================');
   console.log('  ALL SMOKE & INTEGRATION TESTS PASSED!                       ');
   console.log('==============================================================');
