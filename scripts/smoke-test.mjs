@@ -14,6 +14,9 @@
  *    - Automatic daemon SIGKILL crash recovery (respawn + automatic re-`init` before next command)
  * 4. Homebridge v2.4.0 API registration & cached `PlatformAccessory` restart resilience
  *    (verifies zero duplicate UUID/subtype errors and stale service pruning).
+ * 5. Fire-and-forget remote commands: HomeKit writes return immediately, repeated writes while a
+ *    command is in flight send nothing extra, queued opposite requests run in order, and lock /
+ *    remote-start state follows MySubaru confirmations (rolled back on failure).
  */
 
 import assert from 'node:assert/strict';
@@ -769,6 +772,132 @@ async function testHomebridgeV2CachedAccessoryRestart() {
   }
 }
 
+/**
+ * Regression test for duplicate remote commands: HomeKit writes must return
+ * immediately, repeated writes while a command is in flight must not send it
+ * again, and state must update only when MySubaru confirms.
+ */
+async function testFireAndForgetCommands() {
+  console.log('5. Testing fire-and-forget lock / remote start (no duplicate commands)...');
+  const api = new HomebridgeAPI();
+  const logger = createSilentLogger();
+  const platform = new SubaruLinkPlatform(
+    logger,
+    { platform: 'SubaruLink', name: 'SubaruLink', defaultPreset: 'Full Heat', additionalPresets: [] },
+    api,
+  );
+
+  // Controllable bridge: every executeCommand stays pending until the test settles it.
+  const calls = [];
+  platform.bridge = {
+    hasActiveCommand: () => calls.some((c) => !c.settled),
+    getTelemetry: async () => ({ vin: 'JF2BTANC0R0000001', raw: {} }),
+    executeCommand: (vin, command, args) =>
+      new Promise((resolve, reject) => {
+        const call = { vin, command, args, settled: false };
+        call.resolve = (v) => {
+          call.settled = true;
+          resolve(v);
+        };
+        call.reject = (e) => {
+          call.settled = true;
+          reject(e);
+        };
+        calls.push(call);
+      }),
+  };
+
+  const vehicle = {
+    vin: 'JF2BTANC0R0000001',
+    name: 'Test Outback',
+    model_year: '2025',
+    model_name: 'Outback',
+    api_gen: 'g3',
+    is_ev: false,
+    has_remote: true,
+    has_res: true,
+  };
+  const accessory = new api.platformAccessory(vehicle.name, api.hap.uuid.generate(`subarulink-${vehicle.vin}`));
+  const handler = new SubaruVehicleAccessory(platform, accessory, vehicle);
+  const { Service, Characteristic } = api.hap;
+  const lock = accessory.getServiceById(Service.LockMechanism, 'lock-doors');
+  const target = lock.getCharacteristic(Characteristic.LockTargetState);
+  const current = lock.getCharacteristic(Characteristic.LockCurrentState);
+  const settleTick = () => new Promise((r) => setImmediate(r));
+
+  // 1. Three back-to-back unlock writes (the reported bug) -> exactly one command.
+  const writeStart = Date.now();
+  for (let i = 0; i < 3; i++) {
+    await target.handleSetRequest(Characteristic.LockTargetState.UNSECURED);
+  }
+  assert.ok(Date.now() - writeStart < 500, 'HomeKit writes must return without waiting for MySubaru');
+  assert.equal(calls.length, 1, 'Repeated unlock writes while in flight must send only one command');
+  assert.equal(calls[0].command, 'unlock');
+  assert.deepEqual(calls[0].args, { door: 'ALL_DOORS' });
+  assert.equal(
+    await current.handleGetRequest(),
+    Characteristic.LockCurrentState.SECURED,
+    'Current state changes only on confirmation',
+  );
+  assert.equal(await target.handleGetRequest(), Characteristic.LockTargetState.UNSECURED);
+
+  calls[0].resolve(true);
+  await handler.lockRunner.whenIdle();
+  assert.equal(current.value, Characteristic.LockCurrentState.UNSECURED, 'Confirmed unlock updates current state');
+
+  // 2. Failed lock -> state rolls back to the last confirmed state, error logged.
+  await target.handleSetRequest(Characteristic.LockTargetState.SECURED);
+  assert.equal(calls.length, 2);
+  calls[1].resolve(false);
+  await handler.lockRunner.whenIdle();
+  await settleTick();
+  assert.equal(current.value, Characteristic.LockCurrentState.UNSECURED, 'Failed lock must not report locked');
+  assert.equal(target.value, Characteristic.LockTargetState.UNSECURED, 'Failed lock rolls target back');
+  assert.ok(
+    logger.logs.some((l) => l.level === 'error' && l.msg.includes('Lock command failed')),
+    'Failed lock must be logged as an error',
+  );
+
+  // 3. Lock tapped, then unlock tapped while the lock is in flight -> unlock queued, runs after.
+  await target.handleSetRequest(Characteristic.LockTargetState.SECURED);
+  await target.handleSetRequest(Characteristic.LockTargetState.UNSECURED);
+  assert.equal(calls.length, 3, 'Opposite request is queued, not sent concurrently');
+  calls[2].resolve(true);
+  await settleTick();
+  assert.equal(calls.length, 4, 'Queued unlock runs once the lock finishes');
+  assert.equal(calls[3].command, 'unlock');
+  calls[3].resolve(true);
+  await handler.lockRunner.whenIdle();
+  assert.equal(current.value, Characteristic.LockCurrentState.UNSECURED);
+
+  // 4. Remote start: repeated On writes -> one command; switch shows On while pending,
+  //    reverts to Off on failure.
+  const primary = accessory
+    .getServiceById(Service.Switch, 'remote-start-primary')
+    .getCharacteristic(Characteristic.On);
+  await primary.handleSetRequest(true);
+  await primary.handleSetRequest(true);
+  assert.equal(calls.length, 5, 'Repeated remote start writes must send only one command');
+  assert.equal(calls[4].command, 'remote_start');
+  assert.deepEqual(calls[4].args, { preset: 'Full Heat' });
+  assert.equal(await primary.handleGetRequest(), true, 'Switch reads On while start is pending');
+  calls[4].reject(new Error('RemoteServiceFailure: low fuel'));
+  await handler.engineRunner.whenIdle();
+  assert.equal(primary.value, false, 'Failed remote start reverts the switch to Off');
+  assert.equal(await primary.handleGetRequest(), false);
+
+  // 5. Successful start, then a repeat On write while running is not re-sent.
+  await primary.handleSetRequest(true);
+  calls[5].resolve(true);
+  await handler.engineRunner.whenIdle();
+  assert.equal(primary.value, true);
+  await primary.handleSetRequest(true);
+  assert.equal(calls.length, 6, 'Start is not re-sent while the engine is confirmed running');
+
+  handler.dispose();
+  console.log('   ✓ Writes return immediately, duplicates dropped, state follows MySubaru confirmations');
+}
+
 async function main() {
   console.log('==============================================================');
   console.log('  homebridge-subarulink End-to-End Verification Smoke Suite   ');
@@ -777,6 +906,7 @@ async function main() {
   await testRawJsonRpcFramingAndErrors();
   await testBridgeLifecycleConcurrencyAndCrashRecovery();
   await testHomebridgeV2CachedAccessoryRestart();
+  await testFireAndForgetCommands();
   console.log('==============================================================');
   console.log('  ALL SMOKE & INTEGRATION TESTS PASSED!                       ');
   console.log('==============================================================');

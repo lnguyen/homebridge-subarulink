@@ -1,6 +1,12 @@
 import { CharacteristicValue, PlatformAccessory, Service } from 'homebridge';
+import { IntentOutcome, IntentRunner } from './intentRunner';
 import { SubaruLinkPlatform } from './platform';
 import { DiscoveredVehicle, formatLogError, sanitizeHapName } from './settings';
+
+type EngineIntent = { kind: 'start'; preset: string } | { kind: 'stop' };
+
+/** Momentary switches (tailgate, EV charge, wake) flip back to Off after this delay. */
+const MOMENTARY_RESET_MS = 1000;
 
 const DOOR_SENSOR_DEFS = [
   { key: 'front_left_door', label: 'Front Left Door' },
@@ -32,6 +38,12 @@ const WINDOW_SENSOR_LABELS: Record<string, string> = {
  * - EV Battery Service (for Crosstrek PHEV / EV models)
  * - Door, Trunk, Hood & Power Window / Sunroof Contact Sensors
  * - Optional Exterior Temperature Sensor (if reported by vehicle/API in °C)
+ *
+ * Every remote command is fire-and-forget: HomeKit `onSet` handlers return
+ * immediately and the command runs in the background through an
+ * {@link IntentRunner}. State is updated when MySubaru confirms (or rolled back
+ * when it fails). Repeated writes for a command already in flight are dropped,
+ * so a slow MySubaru round trip can never turn into duplicate commands.
  */
 export class SubaruVehicleAccessory {
   private lockService?: Service;
@@ -49,7 +61,13 @@ export class SubaruVehicleAccessory {
   // Internal states
   private lockTargetState: number;
   private lockCurrentState: number;
-  private lockCommandInFlight = false;
+  private readonly lockRunner: IntentRunner<number>;
+  private readonly engineRunner: IntentRunner<EngineIntent>;
+  private readonly lightsRunner: IntentRunner<boolean>;
+  private readonly hornRunner: IntentRunner<boolean>;
+  private readonly tailgateRunner: IntentRunner<true>;
+  private readonly evChargeRunner: IntentRunner<true>;
+  private readonly wakeRunner: IntentRunner<true>;
   private engineRunning = false;
   private activePreset: string | null = null;
   private engineTimer?: NodeJS.Timeout;
@@ -68,6 +86,71 @@ export class SubaruVehicleAccessory {
 
     this.lockTargetState = Characteristic.LockTargetState.SECURED;
     this.lockCurrentState = Characteristic.LockCurrentState.SECURED;
+
+    const onCallbackError = (err: unknown) =>
+      this.platform.log.error(`[${this.vehicle.name}] Internal state update failed: ${formatLogError(err)}`);
+
+    this.lockRunner = new IntentRunner<number>({
+      execute: (target) => this.sendLockCommand(target),
+      onSuccess: (target) => this.onLockSucceeded(target),
+      onFailure: (target, err) => this.onLockFailed(target, err),
+      onCallbackError,
+    });
+    this.engineRunner = new IntentRunner<EngineIntent>({
+      execute: (intent) => this.sendEngineCommand(intent),
+      onSuccess: (intent) => this.onEngineSucceeded(intent),
+      onFailure: (intent, err) => this.onEngineFailed(intent, err),
+      isSame: (a, b) =>
+        a.kind === b.kind && (a.kind === 'stop' || a.preset === (b as { preset: string }).preset),
+      onCallbackError,
+    });
+    this.lightsRunner = new IntentRunner<boolean>({
+      execute: (on) => this.sendSimpleCommand(on ? 'lights' : 'lights_stop'),
+      onSuccess: (on) => this.onLightsSucceeded(on),
+      onFailure: (on, err) => {
+        this.platform.log.error(
+          `[${this.vehicle.name}] ${on ? 'lights' : 'lights_stop'} command failed: ${formatLogError(err)}`,
+        );
+        this.lightsSwitch?.updateCharacteristic(Characteristic.On, this.lightsDisplayState());
+      },
+      onCallbackError,
+    });
+    this.hornRunner = new IntentRunner<boolean>({
+      execute: (on) => this.sendSimpleCommand(on ? 'horn' : 'horn_stop'),
+      onSuccess: (on) => {
+        this.hornActive = on;
+        this.platform.log.info(`[${this.vehicle.name}] Horn ${on ? 'started' : 'stopped'}.`);
+        this.hornSwitch?.updateCharacteristic(Characteristic.On, this.hornDisplayState());
+      },
+      onFailure: (on, err) => {
+        this.platform.log.error(
+          `[${this.vehicle.name}] ${on ? 'horn' : 'horn_stop'} command failed: ${formatLogError(err)}`,
+        );
+        this.hornSwitch?.updateCharacteristic(Characteristic.On, this.hornDisplayState());
+      },
+      onCallbackError,
+    });
+    this.tailgateRunner = new IntentRunner<true>({
+      execute: () => this.sendSimpleCommand('unlock', { door: 'TAILGATE_DOOR' }),
+      onSuccess: () => this.platform.log.info(`[${this.vehicle.name}] Tailgate unlocked.`),
+      onFailure: (_i, err) =>
+        this.platform.log.error(`[${this.vehicle.name}] Tailgate unlock failed: ${formatLogError(err)}`),
+      onCallbackError,
+    });
+    this.evChargeRunner = new IntentRunner<true>({
+      execute: () => this.sendSimpleCommand('charge_start'),
+      onSuccess: () => this.platform.log.info(`[${this.vehicle.name}] EV charging started.`),
+      onFailure: (_i, err) =>
+        this.platform.log.error(`[${this.vehicle.name}] EV charge_start failed: ${formatLogError(err)}`),
+      onCallbackError,
+    });
+    this.wakeRunner = new IntentRunner<true>({
+      // refreshTelemetry logs its own failures and never throws.
+      execute: () => this.refreshTelemetry({ wake: true, force: true }),
+      onSuccess: () => undefined,
+      onFailure: () => undefined,
+      onCallbackError,
+    });
 
     // 1. Accessory Information
     this.accessory
@@ -117,7 +200,7 @@ export class SubaruVehicleAccessory {
       );
       this.primaryResSwitch
         .getCharacteristic(Characteristic.On)
-        .onGet(() => this.engineRunning && this.activePreset === defaultPreset)
+        .onGet(() => this.isPresetOn(defaultPreset))
         .onSet((val) => this.handleRemoteStartSet(defaultPreset, val));
 
       // Additional Preset Switches
@@ -144,7 +227,7 @@ export class SubaruVehicleAccessory {
         const svc = this.getOrAddService(Service.Switch, switchName, subType);
         svc
           .getCharacteristic(Characteristic.On)
-          .onGet(() => this.engineRunning && this.activePreset === cleanPreset)
+          .onGet(() => this.isPresetOn(cleanPreset))
           .onSet((val) => this.handleRemoteStartSet(cleanPreset, val));
 
         this.presetSwitches.set(cleanPreset, svc);
@@ -180,7 +263,7 @@ export class SubaruVehicleAccessory {
       this.lightsSwitch = this.getOrAddService(Service.Switch, name, 'flash-lights');
       this.lightsSwitch
         .getCharacteristic(Characteristic.On)
-        .onGet(() => this.lightsActive)
+        .onGet(() => this.lightsDisplayState())
         .onSet(this.handleLightsSet.bind(this));
     } else {
       this.removeServiceIfPresent(Service.Switch, 'flash-lights');
@@ -192,7 +275,7 @@ export class SubaruVehicleAccessory {
       this.hornSwitch = this.getOrAddService(Service.Switch, name, 'panic-horn');
       this.hornSwitch
         .getCharacteristic(Characteristic.On)
-        .onGet(() => this.hornActive)
+        .onGet(() => this.hornDisplayState())
         .onSet(this.handleHornSet.bind(this));
     } else {
       this.removeServiceIfPresent(Service.Switch, 'panic-horn');
@@ -296,274 +379,237 @@ export class SubaruVehicleAccessory {
     }
   }
 
-  private async handleLockTargetSet(value: CharacteristicValue): Promise<void> {
-    const { Characteristic } = this.platform;
-    const targetSecured = value === Characteristic.LockTargetState.SECURED;
-    this.lockTargetState = Number(value);
-    this.lockCommandInFlight = true;
-
-    try {
-      if (targetSecured) {
-        this.platform.log.debug(`[${this.vehicle.name}] Sending remote LOCK command...`);
-        const ok = await this.platform.bridge.executeCommand(this.vehicle.vin, 'lock');
-        if (ok) {
-          this.lockCurrentState = Characteristic.LockCurrentState.SECURED;
-          this.lockService?.updateCharacteristic(
-            Characteristic.LockCurrentState,
-            this.lockCurrentState,
-          );
-          this.platform.log.info(`[${this.vehicle.name}] Vehicle locked.`);
-        } else {
-          throw new this.platform.api.hap.HapStatusError(
-            this.platform.api.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE,
-          );
-        }
-      } else {
-        const unlockMode = this.platform.config.unlockMode || 'ALL_DOORS';
-        this.platform.log.debug(
-          `[${this.vehicle.name}] Sending remote UNLOCK (${unlockMode}) command...`,
-        );
-        const ok = await this.platform.bridge.executeCommand(this.vehicle.vin, 'unlock', {
-          door: unlockMode,
-        });
-        if (ok) {
-          this.lockCurrentState = Characteristic.LockCurrentState.UNSECURED;
-          this.lockService?.updateCharacteristic(
-            Characteristic.LockCurrentState,
-            this.lockCurrentState,
-          );
-          this.platform.log.info(`[${this.vehicle.name}] Vehicle unlocked (${unlockMode}).`);
-        } else {
-          throw new this.platform.api.hap.HapStatusError(
-            this.platform.api.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE,
-          );
-        }
-      }
-    } catch (err) {
-      if (err instanceof this.platform.api.hap.HapStatusError) {
-        throw err;
-      }
-      this.platform.log.error(`[${this.vehicle.name}] Lock/unlock command failed: ${formatLogError(err)}`);
-      throw new this.platform.api.hap.HapStatusError(
-        this.platform.api.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE,
-      );
-    } finally {
-      this.lockCommandInFlight = false;
+  /** Sends the command through the bridge; throws if MySubaru did not confirm it. */
+  private async sendSimpleCommand(
+    command: Parameters<SubaruLinkPlatform['bridge']['executeCommand']>[1],
+    args: Record<string, unknown> = {},
+  ): Promise<void> {
+    this.platform.log.info(`[${this.vehicle.name}] Sending ${command} command...`);
+    const ok = await this.platform.bridge.executeCommand(this.vehicle.vin, command, args);
+    if (!ok) {
+      throw new Error(`MySubaru did not confirm the ${command} command`);
     }
   }
 
-  private async handleRemoteStartSet(
-    presetName: string,
-    value: CharacteristicValue,
-  ): Promise<void> {
+  private logOutcome(outcome: IntentOutcome, label: string): void {
+    if (outcome === 'duplicate') {
+      this.platform.log.info(
+        `[${this.vehicle.name}] Ignoring repeated ${label} request; one is already in progress.`,
+      );
+    } else if (outcome === 'queued') {
+      this.platform.log.info(
+        `[${this.vehicle.name}] ${label} queued; it will run when the current command finishes.`,
+      );
+    }
+  }
+
+  // ---- Door lock ---------------------------------------------------------
+
+  /** HomeKit write handler: returns immediately; the command runs in the background. */
+  private handleLockTargetSet(value: CharacteristicValue): void {
+    const target = Number(value);
+    this.lockTargetState = target;
+    const label = this.isSecuredTarget(target) ? 'lock' : 'unlock';
+    this.logOutcome(this.lockRunner.request(target), label);
+  }
+
+  private isSecuredTarget(target: number): boolean {
+    return target === this.platform.Characteristic.LockTargetState.SECURED;
+  }
+
+  private async sendLockCommand(target: number): Promise<void> {
+    if (this.isSecuredTarget(target)) {
+      await this.sendSimpleCommand('lock');
+    } else {
+      const unlockMode = this.platform.config.unlockMode || 'ALL_DOORS';
+      await this.sendSimpleCommand('unlock', { door: unlockMode });
+    }
+  }
+
+  private onLockSucceeded(target: number): void {
+    const { Characteristic } = this.platform;
+    const secured = this.isSecuredTarget(target);
+    this.lockCurrentState = secured
+      ? Characteristic.LockCurrentState.SECURED
+      : Characteristic.LockCurrentState.UNSECURED;
+    this.lockService?.updateCharacteristic(Characteristic.LockCurrentState, this.lockCurrentState);
+    if (!this.lockRunner.busy) {
+      this.lockTargetState = target;
+      this.lockService?.updateCharacteristic(Characteristic.LockTargetState, this.lockTargetState);
+    }
+    const mode = secured ? '' : ` (${this.platform.config.unlockMode || 'ALL_DOORS'})`;
+    this.platform.log.info(`[${this.vehicle.name}] Vehicle ${secured ? 'locked' : 'unlocked'}${mode}.`);
+  }
+
+  private onLockFailed(target: number, err: unknown): void {
+    const { Characteristic } = this.platform;
+    const label = this.isSecuredTarget(target) ? 'Lock' : 'Unlock';
+    this.platform.log.error(`[${this.vehicle.name}] ${label} command failed: ${formatLogError(err)}`);
+    if (this.lockRunner.busy) {
+      return; // a newer queued request is about to run and will set the state
+    }
+    // Roll the target back to the last confirmed state so HomeKit stops showing "Locking…/Unlocking…".
+    this.lockTargetState =
+      this.lockCurrentState === Characteristic.LockCurrentState.UNSECURED
+        ? Characteristic.LockTargetState.UNSECURED
+        : Characteristic.LockTargetState.SECURED;
+    this.lockService?.updateCharacteristic(Characteristic.LockTargetState, this.lockTargetState);
+    // The car may still have acted (e.g. MySubaru timed out confirming), so resync from telemetry.
+    void this.refreshTelemetry({ force: true });
+  }
+
+  // ---- Remote engine start / stop ---------------------------------------
+
+  /** HomeKit write handler: returns immediately; the command runs in the background. */
+  private handleRemoteStartSet(presetName: string, value: CharacteristicValue): void {
     const turnOn = Boolean(value);
+    if (turnOn && !this.engineRunner.busy && this.engineRunning && this.activePreset === presetName) {
+      this.platform.log.info(
+        `[${this.vehicle.name}] Remote start (${presetName}) is already running; not sending it again.`,
+      );
+      return;
+    }
+    const intent: EngineIntent = turnOn ? { kind: 'start', preset: presetName } : { kind: 'stop' };
+    const label = turnOn ? `remote start (${presetName})` : 'remote stop';
+    this.logOutcome(this.engineRunner.request(intent), label);
+    this.syncRemoteStartSwitches();
+  }
 
-    try {
-      if (turnOn) {
+  private async sendEngineCommand(intent: EngineIntent): Promise<void> {
+    if (intent.kind === 'start') {
+      await this.sendSimpleCommand('remote_start', { preset: intent.preset });
+    } else {
+      await this.sendSimpleCommand('remote_stop');
+    }
+  }
+
+  private onEngineSucceeded(intent: EngineIntent): void {
+    if (this.engineTimer) {
+      clearTimeout(this.engineTimer);
+      this.engineTimer = undefined;
+    }
+    if (intent.kind === 'stop') {
+      this.engineRunning = false;
+      this.activePreset = null;
+      this.platform.log.info(`[${this.vehicle.name}] Engine stopped.`);
+    } else {
+      this.engineRunning = true;
+      this.activePreset = intent.preset;
+      const runMinutes = Math.max(1, Math.min(20, this.platform.config.engineRunDurationMinutes ?? 10));
+      this.engineTimer = setTimeout(() => {
         this.platform.log.debug(
-          `[${this.vehicle.name}] Sending REMOTE START command with preset "${presetName}"...`,
-        );
-        const ok = await this.platform.bridge.executeCommand(
-          this.vehicle.vin,
-          'remote_start',
-          { preset: presetName },
-        );
-
-        if (!ok) {
-          this.syncRemoteStartSwitches();
-          throw new this.platform.api.hap.HapStatusError(
-            this.platform.api.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE,
-          );
-        }
-
-        this.engineRunning = true;
-        this.activePreset = presetName;
-        this.syncRemoteStartSwitches();
-
-        const runMinutes = Math.max(
-          1,
-          Math.min(20, this.platform.config.engineRunDurationMinutes ?? 10),
-        );
-        if (this.engineTimer) {
-          clearTimeout(this.engineTimer);
-        }
-        this.engineTimer = setTimeout(() => {
-          this.platform.log.debug(
-            `[${this.vehicle.name}] Remote start ${runMinutes}-minute cycle finished; resetting HomeKit switch state to Off.`,
-          );
-          this.engineRunning = false;
-          this.activePreset = null;
-          this.syncRemoteStartSwitches();
-        }, runMinutes * 60 * 1000);
-        this.engineTimer.unref?.();
-
-        this.platform.log.info(
-          `[${this.vehicle.name}] Remote start (${presetName}) active for ${runMinutes}m.`,
-        );
-      } else {
-        this.platform.log.debug(`[${this.vehicle.name}] Sending REMOTE STOP command...`);
-        if (this.engineTimer) {
-          clearTimeout(this.engineTimer);
-          this.engineTimer = undefined;
-        }
-
-        const ok = await this.platform.bridge.executeCommand(
-          this.vehicle.vin,
-          'remote_stop',
+          `[${this.vehicle.name}] Remote start ${runMinutes}-minute cycle finished; resetting HomeKit switch state to Off.`,
         );
         this.engineRunning = false;
         this.activePreset = null;
         this.syncRemoteStartSwitches();
-
-        if (!ok) {
-          throw new this.platform.api.hap.HapStatusError(
-            this.platform.api.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE,
-          );
-        }
-        this.platform.log.info(`[${this.vehicle.name}] Engine stopped.`);
-      }
-    } catch (err) {
-      if (err instanceof this.platform.api.hap.HapStatusError) {
-        throw err;
-      }
-      this.platform.log.error(`[${this.vehicle.name}] Remote start/stop failed: ${formatLogError(err)}`);
-      this.syncRemoteStartSwitches();
-      throw new this.platform.api.hap.HapStatusError(
-        this.platform.api.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE,
+      }, runMinutes * 60 * 1000);
+      this.engineTimer.unref?.();
+      this.platform.log.info(
+        `[${this.vehicle.name}] Remote start (${intent.preset}) active for ${runMinutes}m.`,
       );
     }
+    this.syncRemoteStartSwitches();
+  }
+
+  private onEngineFailed(intent: EngineIntent, err: unknown): void {
+    const label = intent.kind === 'start' ? `Remote start (${intent.preset})` : 'Remote stop';
+    this.platform.log.error(`[${this.vehicle.name}] ${label} failed: ${formatLogError(err)}`);
+    // Engine state is unchanged; switches fall back to the last confirmed state.
+    this.syncRemoteStartSwitches();
+  }
+
+  /** A preset switch shows On while its start is pending, or while it is confirmed running. */
+  private isPresetOn(preset: string): boolean {
+    const latest = this.engineRunner.latest;
+    if (latest) {
+      return latest.kind === 'start' && latest.preset === preset;
+    }
+    return this.engineRunning && this.activePreset === preset;
   }
 
   private syncRemoteStartSwitches(): void {
     const { Characteristic } = this.platform;
     const defaultPreset = (this.platform.config.defaultPreset || 'Full Heat').trim() || 'Full Heat';
 
-    this.primaryResSwitch?.updateCharacteristic(
-      Characteristic.On,
-      this.engineRunning && this.activePreset === defaultPreset,
-    );
+    this.primaryResSwitch?.updateCharacteristic(Characteristic.On, this.isPresetOn(defaultPreset));
 
     for (const [preset, svc] of this.presetSwitches.entries()) {
-      svc.updateCharacteristic(
-        Characteristic.On,
-        this.engineRunning && this.activePreset === preset,
-      );
+      svc.updateCharacteristic(Characteristic.On, this.isPresetOn(preset));
     }
   }
 
-  private async handleTailgateUnlock(value: CharacteristicValue): Promise<void> {
+  // ---- Momentary switches (tailgate, wake/poll, EV charge) ---------------
+
+  /** Fires a one-shot command in the background and flips the switch back to Off. */
+  private triggerMomentary(
+    value: CharacteristicValue,
+    runner: IntentRunner<true>,
+    service: Service | undefined,
+    label: string,
+  ): void {
     if (!value) {
       return;
     }
-    this.platform.log.info(`[${this.vehicle.name}] Unlocking Tailgate...`);
-    let ok = false;
-    try {
-      ok = await this.platform.bridge.executeCommand(this.vehicle.vin, 'unlock', {
-        door: 'TAILGATE_DOOR',
-      });
-    } catch (err) {
-      this.platform.log.error(`[${this.vehicle.name}] Tailgate unlock failed: ${formatLogError(err)}`);
-    } finally {
-      const t = setTimeout(() => {
-        this.tailgateSwitch?.updateCharacteristic(this.platform.Characteristic.On, false);
-      }, 1000);
-      t.unref?.();
-    }
-    if (!ok) {
-      throw new this.platform.api.hap.HapStatusError(
-        this.platform.api.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE,
-      );
-    }
+    this.logOutcome(runner.request(true), label);
+    const t = setTimeout(() => {
+      service?.updateCharacteristic(this.platform.Characteristic.On, false);
+    }, MOMENTARY_RESET_MS);
+    t.unref?.();
   }
 
-  private async handleLightsSet(value: CharacteristicValue): Promise<void> {
-    const turnOn = Boolean(value);
-    const cmd = turnOn ? 'lights' : 'lights_stop';
-    this.platform.log.info(`[${this.vehicle.name}] Sending ${cmd} command...`);
-    let ok = false;
-    try {
-      ok = await this.platform.bridge.executeCommand(this.vehicle.vin, cmd);
-    } catch (err) {
-      this.platform.log.error(`[${this.vehicle.name}] ${cmd} command failed: ${formatLogError(err)}`);
-    }
-    if (!ok) {
-      throw new this.platform.api.hap.HapStatusError(
-        this.platform.api.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE,
+  private handleTailgateUnlock(value: CharacteristicValue): void {
+    this.triggerMomentary(value, this.tailgateRunner, this.tailgateSwitch, 'tailgate unlock');
+  }
+
+  private handleForceWakePoll(value: CharacteristicValue): void {
+    if (value) {
+      this.platform.log.info(
+        `[${this.vehicle.name}] Waking vehicle telematics module (Controller.update) to pull fresh sensor status...`,
       );
     }
-    this.lightsActive = turnOn;
+    this.triggerMomentary(value, this.wakeRunner, this.locateSwitch, 'vehicle wake/poll');
+  }
+
+  private handleEvChargeStart(value: CharacteristicValue): void {
+    this.triggerMomentary(value, this.evChargeRunner, this.evChargeSwitch, 'EV charge start');
+  }
+
+  // ---- Lights & horn -----------------------------------------------------
+
+  private handleLightsSet(value: CharacteristicValue): void {
+    const on = Boolean(value);
+    this.logOutcome(this.lightsRunner.request(on), on ? 'flash lights' : 'stop lights');
+  }
+
+  private lightsDisplayState(): boolean {
+    return this.lightsRunner.latest ?? this.lightsActive;
+  }
+
+  private onLightsSucceeded(on: boolean): void {
+    this.lightsActive = on;
     if (this.lightsTimer) {
       clearTimeout(this.lightsTimer);
       this.lightsTimer = undefined;
     }
-    if (turnOn) {
+    if (on) {
       this.lightsTimer = setTimeout(() => {
         this.lightsActive = false;
-        this.lightsSwitch?.updateCharacteristic(this.platform.Characteristic.On, false);
+        this.lightsSwitch?.updateCharacteristic(this.platform.Characteristic.On, this.lightsDisplayState());
       }, 15000);
       this.lightsTimer.unref?.();
     }
+    this.platform.log.info(`[${this.vehicle.name}] Lights ${on ? 'flashing' : 'stopped'}.`);
+    this.lightsSwitch?.updateCharacteristic(this.platform.Characteristic.On, this.lightsDisplayState());
   }
 
-  private async handleHornSet(value: CharacteristicValue): Promise<void> {
-    const turnOn = Boolean(value);
-    const cmd = turnOn ? 'horn' : 'horn_stop';
-    this.platform.log.info(`[${this.vehicle.name}] Sending ${cmd} command...`);
-    let ok = false;
-    try {
-      ok = await this.platform.bridge.executeCommand(this.vehicle.vin, cmd);
-    } catch (err) {
-      this.platform.log.error(`[${this.vehicle.name}] ${cmd} command failed: ${formatLogError(err)}`);
-    }
-    if (!ok) {
-      throw new this.platform.api.hap.HapStatusError(
-        this.platform.api.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE,
-      );
-    }
-    this.hornActive = turnOn;
+  private handleHornSet(value: CharacteristicValue): void {
+    const on = Boolean(value);
+    this.logOutcome(this.hornRunner.request(on), on ? 'horn' : 'stop horn');
   }
 
-  private async handleForceWakePoll(value: CharacteristicValue): Promise<void> {
-    if (!value) {
-      return;
-    }
-    this.platform.log.info(
-      `[${this.vehicle.name}] Waking vehicle telematics module (Controller.update) to pull fresh sensor status...`,
-    );
-    try {
-      await this.refreshTelemetry({ wake: true, force: true });
-    } finally {
-      const t = setTimeout(() => {
-        this.locateSwitch?.updateCharacteristic(this.platform.Characteristic.On, false);
-      }, 1000);
-      t.unref?.();
-    }
-  }
-
-  private async handleEvChargeStart(value: CharacteristicValue): Promise<void> {
-    if (!value) {
-      return;
-    }
-    this.platform.log.info(`[${this.vehicle.name}] Starting PHEV/EV Charging...`);
-    let ok = false;
-    try {
-      ok = await this.platform.bridge.executeCommand(
-        this.vehicle.vin,
-        'charge_start',
-      );
-    } catch (err) {
-      this.platform.log.error(`[${this.vehicle.name}] EV charge_start failed: ${formatLogError(err)}`);
-    } finally {
-      const t = setTimeout(() => {
-        this.evChargeSwitch?.updateCharacteristic(this.platform.Characteristic.On, false);
-      }, 1500);
-      t.unref?.();
-    }
-    if (!ok) {
-      throw new this.platform.api.hap.HapStatusError(
-        this.platform.api.hap.HAPStatus.SERVICE_COMMUNICATION_FAILURE,
-      );
-    }
+  private hornDisplayState(): boolean {
+    return this.hornRunner.latest ?? this.hornActive;
   }
 
   public async refreshTelemetry(options: { wake?: boolean; force?: boolean } = {}): Promise<void> {
@@ -630,7 +676,7 @@ export class SubaruVehicleAccessory {
       }
 
       // 3. Sync Lock Mechanism State if vehicle reports valid LOCKED / UNLOCKED status
-      if (this.lockService && !this.lockCommandInFlight && telemetry.locks) {
+      if (this.lockService && !this.lockRunner.busy && telemetry.locks) {
         const lockValues = Object.values(telemetry.locks)
           .map((v) => v.toUpperCase())
           .filter((v) => v === 'LOCKED' || v === 'UNLOCKED');
