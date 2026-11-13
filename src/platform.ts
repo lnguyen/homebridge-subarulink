@@ -21,6 +21,12 @@ import { SubaruVehicleAccessory } from './platformAccessory';
 /** Default pause between one remote command finishing and the next being sent. */
 export const DEFAULT_COMMAND_GAP_SECONDS = 2;
 
+/**
+ * How long an idle queue waits before sending, so commands fired together by one
+ * HomeKit automation can be put in priority order (they arrive ms apart, in any order).
+ */
+export const DEFAULT_COMMAND_BATCH_WINDOW_MS = 500;
+
 export class SubaruLinkPlatform implements DynamicPlatformPlugin {
   public readonly Service: typeof Service;
   public readonly Characteristic: typeof Characteristic;
@@ -41,12 +47,17 @@ export class SubaruLinkPlatform implements DynamicPlatformPlugin {
     this.Characteristic = this.api.hap.Characteristic;
 
     const gapSeconds = Number(this.config?.commandGapSeconds ?? DEFAULT_COMMAND_GAP_SECONDS);
+    const batchWindowMs = Number(this.config?.commandBatchWindowMs ?? DEFAULT_COMMAND_BATCH_WINDOW_MS);
     this.commandQueue = new CommandQueue({
       minGapMs: Number.isFinite(gapSeconds) && gapSeconds >= 0 ? gapSeconds * 1000 : DEFAULT_COMMAND_GAP_SECONDS * 1000,
+      batchWindowMs:
+        Number.isFinite(batchWindowMs) && batchWindowMs >= 0 ? batchWindowMs : DEFAULT_COMMAND_BATCH_WINDOW_MS,
       onQueued: (label, ahead) =>
         this.log.info(
           `${label} queued behind ${ahead} other command(s); it will be sent when they finish.`,
         ),
+      onPrioritized: (label, overtaken) =>
+        this.log.info(`${label} goes first, ahead of ${overtaken.join(', ')}.`),
     });
 
     if (!this.config || !this.config.username || !this.config.password || !this.config.pin) {

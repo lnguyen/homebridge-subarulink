@@ -121,6 +121,11 @@ export interface SubaruLinkConfig extends PlatformConfig {
   engineRunDurationMinutes?: number;
   /** Seconds to wait after one remote command finishes before sending the next (default 2). */
   commandGapSeconds?: number;
+  /**
+   * Advanced (not shown in the UI): ms an idle command queue waits before sending, so commands
+   * fired together can be ordered by priority (default 500).
+   */
+  commandBatchWindowMs?: number;
   unlockMode?: 'ALL_DOORS' | 'DRIVERS_DOOR' | 'TAILGATE_DOOR';
   exposeTailgateUnlockSwitch?: boolean;
   exposeHornSwitch?: boolean;

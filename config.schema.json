@@ -91,7 +91,7 @@
         "default": 2,
         "minimum": 0,
         "maximum": 30,
-        "description": "MySubaru runs one remote command at a time. When several are triggered together (e.g. an automation that starts the engine and unlocks the doors), they are queued and sent one after another, waiting this long after each finishes."
+        "description": "MySubaru runs one remote command at a time. When several are triggered together (e.g. an automation that starts the engine and unlocks the doors), they are queued and sent one after another, waiting this long after each finishes. Remote start always goes first, because it locks the car."
       },
       "unlockMode": {
         "title": "Default Door Unlock Target",

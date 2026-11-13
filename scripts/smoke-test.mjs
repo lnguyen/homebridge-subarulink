@@ -19,6 +19,8 @@
  *    remote-start state follows MySubaru confirmations (rolled back on failure).
  * 6. Account-wide command queue: simultaneous commands (e.g. start + unlock from one automation)
  *    reach MySubaru one at a time with `commandGapSeconds` between them; failures do not block.
+ * 7. Remote start priority: fired together with an unlock (in either order), remote start is sent
+ *    first because it locks the car; a confirmed remote start on its own marks the doors Locked.
  */
 
 import assert from 'node:assert/strict';
@@ -827,6 +829,7 @@ async function testFireAndForgetCommands() {
       defaultPreset: 'Full Heat',
       additionalPresets: [],
       commandGapSeconds: 0, // queue spacing is covered by section 6
+      commandBatchWindowMs: 0, // priority batching is covered by section 7
     },
     api,
   );
@@ -978,6 +981,7 @@ async function testCommandQueueSpacing() {
       defaultPreset: 'Full Heat',
       additionalPresets: [],
       commandGapSeconds: GAP_MS / 1000,
+      commandBatchWindowMs: 0, // priority batching is covered by section 7
     },
     api,
   );
@@ -1052,6 +1056,88 @@ async function testCommandQueueSpacing() {
   console.log(`   ✓ Simultaneous start + unlock sent one at a time with a ${GAP_MS}ms gap; failures do not block`);
 }
 
+/**
+ * Remote start locks the car, so when an automation fires unlock and remote
+ * start together, remote start must reach MySubaru first even if HomeKit
+ * delivers the unlock first. A start on its own marks the doors Locked.
+ */
+async function testRemoteStartPriority() {
+  console.log('7. Testing remote start goes before a simultaneous unlock (start locks the car)...');
+  const BATCH_MS = 120;
+  const GAP_MS = 30;
+  const api = new HomebridgeAPI();
+  const logger = createSilentLogger();
+  const platform = new SubaruLinkPlatform(
+    logger,
+    {
+      platform: 'SubaruLink',
+      name: 'SubaruLink',
+      defaultPreset: 'Full Heat',
+      additionalPresets: [],
+      commandGapSeconds: GAP_MS / 1000,
+      commandBatchWindowMs: BATCH_MS,
+    },
+    api,
+  );
+  const { calls } = installControllableBridge(platform);
+  const { handler, accessory } = createTestVehicleAccessory(api, platform);
+  const { Service, Characteristic } = api.hap;
+  const lockSvc = accessory.getServiceById(Service.LockMechanism, 'lock-doors');
+  const lockTarget = lockSvc.getCharacteristic(Characteristic.LockTargetState);
+  const lockCurrent = lockSvc.getCharacteristic(Characteristic.LockCurrentState);
+  const primary = accessory
+    .getServiceById(Service.Switch, 'remote-start-primary')
+    .getCharacteristic(Characteristic.On);
+
+  // HomeKit delivers the unlock first, the start a few ms later (same automation).
+  await lockTarget.handleSetRequest(Characteristic.LockTargetState.UNSECURED);
+  await sleepMs(5);
+  await primary.handleSetRequest(true);
+  await settleTick();
+  assert.equal(calls.length, 0, 'Idle queue waits the batch window before sending');
+
+  await sleepMs(BATCH_MS + 50);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].command, 'remote_start', 'Remote start is sent before the earlier unlock');
+  assert.ok(
+    logger.logs.some((l) => l.msg.includes('remote_start goes first, ahead of') && l.msg.includes('unlock')),
+    'Reordering is logged',
+  );
+
+  calls[0].resolve(true);
+  await handler.engineRunner.whenIdle();
+  assert.equal(
+    await lockTarget.handleGetRequest(),
+    Characteristic.LockTargetState.UNSECURED,
+    'Pending unlock is not overwritten by the start locking the car',
+  );
+
+  await sleepMs(GAP_MS + 50);
+  assert.equal(calls.length, 2);
+  assert.equal(calls[1].command, 'unlock', 'Unlock runs after remote start');
+  calls[1].resolve(true);
+  await handler.lockRunner.whenIdle();
+  assert.equal(lockCurrent.value, Characteristic.LockCurrentState.UNSECURED, 'Car ends up running and unlocked');
+  assert.equal(primary.value, true);
+
+  // Stop, then a remote start on its own: HomeKit shows the doors Locked afterwards.
+  await primary.handleSetRequest(false);
+  await sleepMs(BATCH_MS + 50);
+  assert.equal(calls[2].command, 'remote_stop');
+  calls[2].resolve(true);
+  await handler.engineRunner.whenIdle();
+  await primary.handleSetRequest(true);
+  await sleepMs(BATCH_MS + GAP_MS + 50);
+  assert.equal(calls[3].command, 'remote_start');
+  calls[3].resolve(true);
+  await handler.engineRunner.whenIdle();
+  assert.equal(lockCurrent.value, Characteristic.LockCurrentState.SECURED, 'Remote start marks the doors Locked');
+  assert.equal(lockTarget.value, Characteristic.LockTargetState.SECURED);
+
+  handler.dispose();
+  console.log('   ✓ Remote start overtakes a simultaneous unlock; start alone marks the doors Locked');
+}
+
 async function main() {
   console.log('==============================================================');
   console.log('  homebridge-subarulink End-to-End Verification Smoke Suite   ');
@@ -1062,6 +1148,7 @@ async function main() {
   await testHomebridgeV2CachedAccessoryRestart();
   await testFireAndForgetCommands();
   await testCommandQueueSpacing();
+  await testRemoteStartPriority();
   console.log('==============================================================');
   console.log('  ALL SMOKE & INTEGRATION TESTS PASSED!                       ');
   console.log('==============================================================');

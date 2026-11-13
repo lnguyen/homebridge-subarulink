@@ -8,6 +8,15 @@ type EngineIntent = { kind: 'start'; preset: string } | { kind: 'stop' };
 /** Momentary switches (tailgate, EV charge, wake) flip back to Off after this delay. */
 const MOMENTARY_RESET_MS = 1000;
 
+/**
+ * Queue priority per command (higher is sent first among waiting commands).
+ * Remote start locks the car, so it must run before a queued unlock; otherwise
+ * "start + unlock" would leave the car locked.
+ */
+const COMMAND_PRIORITY: Partial<Record<string, number>> = {
+  remote_start: 10,
+};
+
 const DOOR_SENSOR_DEFS = [
   { key: 'front_left_door', label: 'Front Left Door' },
   { key: 'front_right_door', label: 'Front Right Door' },
@@ -392,10 +401,14 @@ export class SubaruVehicleAccessory {
     args: Record<string, unknown> = {},
   ): Promise<void> {
     const label = `[${this.vehicle.name}] ${command}`;
-    const ok = await this.platform.commandQueue.run(label, () => {
-      this.platform.log.info(`[${this.vehicle.name}] Sending ${command} command...`);
-      return this.platform.bridge.executeCommand(this.vehicle.vin, command, args);
-    });
+    const ok = await this.platform.commandQueue.run(
+      label,
+      () => {
+        this.platform.log.info(`[${this.vehicle.name}] Sending ${command} command...`);
+        return this.platform.bridge.executeCommand(this.vehicle.vin, command, args);
+      },
+      { priority: COMMAND_PRIORITY[command] ?? 0 },
+    );
     if (!ok) {
       throw new Error(`MySubaru did not confirm the ${command} command`);
     }
@@ -518,8 +531,26 @@ export class SubaruVehicleAccessory {
       this.platform.log.info(
         `[${this.vehicle.name}] Remote start (${intent.preset}) active for ${runMinutes}m.`,
       );
+      this.markLockedByRemoteStart();
     }
     this.syncRemoteStartSwitches();
+  }
+
+  /**
+   * Remote start locks the doors. Reflect that in HomeKit, unless a lock/unlock
+   * request is still pending (e.g. the unlock queued behind this start), which
+   * will set the final state itself.
+   */
+  private markLockedByRemoteStart(): void {
+    if (!this.lockService || this.lockRunner.busy) {
+      return;
+    }
+    const { Characteristic } = this.platform;
+    this.lockCurrentState = Characteristic.LockCurrentState.SECURED;
+    this.lockTargetState = Characteristic.LockTargetState.SECURED;
+    this.lockService.updateCharacteristic(Characteristic.LockCurrentState, this.lockCurrentState);
+    this.lockService.updateCharacteristic(Characteristic.LockTargetState, this.lockTargetState);
+    this.platform.log.info(`[${this.vehicle.name}] Remote start locked the doors; lock shows Locked.`);
   }
 
   private onEngineFailed(intent: EngineIntent, err: unknown): void {
